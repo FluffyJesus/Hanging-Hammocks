@@ -5,11 +5,11 @@ using UnityEngine;
 
 namespace HangingHammock
 {
-    // Порядок 10000: наши Update/FixedUpdate/LateUpdate идут ПОСЛЕ ванильного ItemRigidbody
+    // Порядок 10000: наши Update/FixedUpdate/LateUpdate идут после ванильного ItemRigidbody
     [DefaultExecutionOrder(10000)]
     public class HammockHanger : MonoBehaviour
     {
-        // Заполняется фабрикой, копируется при Instantiate
+        // Сериализуемые значения, копируются при Instantiate
         public Vector3 bCenter;
         public Vector3 bExt;
         public Transform[] swingParts;
@@ -22,7 +22,10 @@ namespace HangingHammock
         internal const int Mask = ~((1 << 2) | (1 << 5));
         private const string KeyPrefix = "HangingHammock.";
         private const float LongStiffness = 4f, LongDamping = 2f, MaxLongAngle = 6f;
+        private const float AnchorSearch = 2.5f, AnchorMinDist = 0.12f;
         private static readonly CultureInfo CI = CultureInfo.InvariantCulture;
+        private static readonly FieldInfo OnBoatF =
+            typeof(ItemRigidbody).GetField("onBoat", BindingFlags.NonPublic | BindingFlags.Instance);
 
         private ShipItem item;
         private ItemRigidbody twinC;
@@ -32,7 +35,7 @@ namespace HangingHammock
         private BoxCollider box;
         private bool scaleLogged;
 
-        // Коллайдеры близнеца (их создаёт ItemRigidbody.AddCollider через ~3 физ. кадра после спавна)
+        // Коллайдеры двойника (ItemRigidbody.AddCollider создаёт их через ~3 физ. кадра)
         private Collider[] twinCols;
         private BoxCollider twinBox;
         private Vector3 twinBoxOrigSize, twinBoxOrigCenter;
@@ -66,6 +69,11 @@ namespace HangingHammock
         private Quaternion prevRestRot;
 
         private RopeVisual[] ropes;
+
+        // Точки крепления к потолку (локально, в системе гамака). Считаются лучами при подвешивании
+        private readonly Vector3[] topL = new Vector3[2];
+        private bool anchorsDirty = true;
+        private float anchorRecheckAt;
 
         private float Top => bCenter.y + bExt.y;
         private float Height => 2f * bExt.y;
@@ -108,19 +116,33 @@ namespace HangingHammock
             return true;
         }
 
-        /// Висящий гамак: близнец кинематический (attached). inStove и disableCol не используем:
-        /// inStove ломает синхронизацию, disableCol ваниль сама же перебивает
         private void SetHungPhysics(bool hung)
         {
             if (twinC == null) return;
             twinC.attached = hung;
             twinC.disableCol = false;
-            twinC.inStove = false;   // на случай сейвов от прошлых версий
+            twinC.inStove = false;
         }
 
-        // ????????? коллайдеры близнеца ?????????
-        /// Вызывается в FixedUpdate ПОСЛЕ ванильного ItemRigidbody.FixedUpdate (который каждый тик
-        /// включает коллайдеры обратно) и ДО шага физики — поэтому наше состояние и действует
+        // ????????? видимый корабль <-> физическая копия (walkCol) ?????????
+        private bool OnBoat(out Transform boat, out Transform walk)
+        {
+            boat = item != null ? item.currentActualBoat : null;
+            walk = item != null ? item.currentWalkCol : null;
+            if (boat == null || walk == null || twinC == null || OnBoatF == null) return false;
+            return (bool)OnBoatF.GetValue(twinC);
+        }
+
+        private Vector3 ToPhys(Vector3 p) =>
+            OnBoat(out var b, out var w) ? w.TransformPoint(b.InverseTransformPoint(p)) : p;
+
+        private Vector3 ToItem(Vector3 p) =>
+            OnBoat(out var b, out var w) ? b.TransformPoint(w.InverseTransformPoint(p)) : p;
+
+        private Quaternion ToPhys(Quaternion q) =>
+            OnBoat(out var b, out var w) ? w.rotation * Quaternion.Inverse(b.rotation) * q : q;
+
+        // ????????? коллайдеры двойника ?????????
         private void ManageTwinColliders()
         {
             if (twin == null) return;
@@ -129,7 +151,7 @@ namespace HangingHammock
                 twinCols = twin.GetComponentsInChildren<Collider>(true);
                 twinBox = twin.GetComponent<BoxCollider>();
                 if (twinBox != null) { twinBoxOrigSize = twinBox.size; twinBoxOrigCenter = twinBox.center; }
-                if (twinCols.Length == 0) return;   // AddCollider ещё не отработал
+                if (twinCols.Length == 0) return;
             }
 
             bool held = item != null && item.held != null;
@@ -137,7 +159,6 @@ namespace HangingHammock
 
             if (IsHung && Plugin.SolidWhenHung.Value && twinBox != null)
             {
-                // Твёрдый режим: коробка по габаритам полотна
                 if (!twinBoxResized)
                 {
                     twinBox.center = Vector3.zero;
@@ -152,7 +173,6 @@ namespace HangingHammock
             if (IsHung || grace)
                 foreach (var c in twinCols)
                     if (c != null && c.enabled) c.enabled = false;
-            // иначе ваниль сама включит их в следующем FixedUpdate
         }
 
         private void RestoreTwinBox()
@@ -169,7 +189,6 @@ namespace HangingHammock
             if (item == null || !EnsureTwin()) return;
             aliveTime += Time.unscaledDeltaTime;
 
-            // Спать можно только в подвешенном гамаке
             if (GameState.inBed == transform && !IsHung && Sleep.instance != null)
             {
                 Sleep.instance.LeaveBed();
@@ -182,7 +201,7 @@ namespace HangingHammock
 
             if (held)
             {
-                if (!wasHeld) hangMode = false;   // только что подобрали: в руках тюк
+                if (!wasHeld) hangMode = false;
                 if (IsHung) Unhang();
 
                 if (Input.GetKeyDown(Plugin.ModeKey.Value) && !GameState.inCursorMenu)
@@ -193,7 +212,7 @@ namespace HangingHammock
                 }
                 item.holdDistance = hangMode ? Tuning.HangHold : Tuning.BundleHold;
 
-                canHang = hangMode && ProbeForHang(out probeUp, out _, out _);
+                canHang = hangMode && ProbeForHang(ToPhys(transform.position), out probeUp, out _, out _);
                 if (canHang && !lastCanHang) Notify("Release to hang the hammock");
                 lastCanHang = canHang;
             }
@@ -213,7 +232,7 @@ namespace HangingHammock
 
         private void UpdateHung()
         {
-            if (!item.nailed) { Unhang(); Notify("Hammock taken down"); return; }   // сняли молотком
+            if (!item.nailed) { Unhang(); Notify("Hammock taken down"); return; }
             if (!twinC.attached) twinC.attached = true;
             if (twinC.inStove) twinC.inStove = false;
             if (HandleTakeDown()) return;
@@ -239,8 +258,8 @@ namespace HangingHammock
             pinParent = twin.parent; pinPos = twin.localPosition; pinRot = twin.localRotation; pinTimer = seconds;
         }
 
-        // ????????? подвешивание ?????????
-        internal static bool CastStatic(Vector3 origin, Vector3 dir, float max, out RaycastHit best)
+        // ????????? лучи ?????????
+        internal static bool CastStatic(Vector3 origin, Vector3 dir, float max, out RaycastHit best, float minDist = 0f)
         {
             best = default;
             bool oldBack = Physics.queriesHitBackfaces;
@@ -251,6 +270,7 @@ namespace HangingHammock
             float bestD = float.MaxValue; bool found = false;
             foreach (var h in hits)
             {
+                if (h.distance < minDist) continue;
                 var c = h.collider;
                 if (c.GetComponentInParent<ShipItem>() != null) continue;
                 if (c.GetComponentInParent<ItemRigidbody>() != null) continue;
@@ -261,10 +281,10 @@ namespace HangingHammock
             return found;
         }
 
-        private bool ProbeForHang(out float up, out float room, out float len)
+        private bool ProbeForHang(Vector3 origin, out float up, out float room, out float len)
         {
             up = room = len = 0f;
-            if (!CastStatic(twin.position, Vector3.up, Tuning.MaxCeiling, out var ch)) return false;
+            if (!CastStatic(origin, Vector3.up, Tuning.MaxCeiling, out var ch)) return false;
             if (Mathf.Abs(ch.normal.y) < 0.5f) return false;
             up = ch.distance;
             room = CastStatic(ch.point + Vector3.down * 0.05f, Vector3.down, 8f, out var fh) ? fh.distance + 0.05f : 8f;
@@ -274,9 +294,46 @@ namespace HangingHammock
             return true;
         }
 
+        /// Луч из угла гамака вдоль расчётного направления верёвки: первая преграда — точка крепления.
+        /// Потолок выше — верёвка дотягивается, балка ниже — цепляется за балку. m — физическая система гамака
+        private static Vector3 FindAnchor(Matrix4x4 m, Vector3 endL, Vector3 nominalL)
+        {
+            Vector3 a = m.MultiplyPoint3x4(endL), b = m.MultiplyPoint3x4(nominalL);
+            Vector3 d = b - a;
+            float dist = d.magnitude;
+            if (dist < 1e-3f) return b;
+            Vector3 dir = d / dist;
+
+            if (CastStatic(a, dir, dist + AnchorSearch, out var h, AnchorMinDist)) return h.point;
+
+            Vector3 up = m.MultiplyVector(Vector3.up).normalized;   // запасной вариант — вертикально над точкой
+            if (CastStatic(b - up * 0.3f, up, AnchorSearch + 0.3f, out h)) return h.point;
+            return b;
+        }
+
+        private void ComputeHungAnchors()
+        {
+            if (twin == null) return;
+            Matrix4x4 m = twin.localToWorldMatrix;
+            float ceilY = Top + ropeLength;
+            for (int i = 0; i < 2; i++)
+            {
+                float sign = i == 0 ? -1f : 1f;
+                Vector3 e = EndLocal(sign);
+                topL[i] = twin.InverseTransformPoint(FindAnchor(m, e, TopAnchor(e, sign, ceilY)));
+            }
+            anchorsDirty = false;
+        }
+
+        private void MarkAnchorsDirty(float recheckDelay)
+        {
+            anchorsDirty = true;
+            anchorRecheckAt = Time.time + recheckDelay;
+        }
+
         private void Hang()
         {
-            if (!ProbeForHang(out float up, out _, out float len)) return;
+            if (!ProbeForHang(twin.position, out float up, out _, out float len)) return;
 
             Vector3 ceil = twin.position + Vector3.up * up;
             Vector3 fwd = Vector3.ProjectOnPlane(twin.forward, Vector3.up);
@@ -296,6 +353,7 @@ namespace HangingHammock
             IsHung = true;
             hangMode = false;
             ResetSwing();
+            MarkAnchorsDirty(0.75f);
             Save();
             UISoundPlayer.instance.PlayUISound(UISounds.winchUnclick, 1f, 0.6f);
             Notify("Hammock hung");
@@ -312,6 +370,8 @@ namespace HangingHammock
             RemoveSave();
             SetRopesVisible(false);
             ResetSwing();
+            anchorsDirty = true;
+            anchorRecheckAt = 0f;
             partsDirty = true;
             ResetParts();
         }
@@ -340,7 +400,6 @@ namespace HangingHammock
 
         private IEnumerator TakeDown(GoPointer ptr)
         {
-            // Коллайдеры не включаем, пока тюк не окажется в руках (там они станут триггерами)
             colGraceUntil = Time.unscaledTime + 1f;
             item.nailed = false;
             Unhang();
@@ -402,17 +461,16 @@ namespace HangingHammock
 
             ropeLength = newLen;
             hasPrev = false;
+            MarkAnchorsDirty(0.3f);
             Save();
             UISoundPlayer.instance.PlayUISound(UISounds.winchClick, 0.6f, 1f);
             Notify("Rope: " + ropeLength.ToString("0.00", CI) + " m");
         }
 
-        // ????????? визуал, качание, верёвки ?????????
+        // ????????? визуал, качание, обводка ?????????
         private Vector3 RestPos(int i) =>
             i == 0 ? restPos[0] + Vector3.up * Tuning.SleepOffset : restPos[i];
 
-        /// ItemRigidbody.LateUpdate ставит localScale = 1, а у объектов сцены острова масштаб не 1.
-        /// Мы идём после него — компенсируем масштаб родителя, пока тюк на прилавке
         private void FixShopScale()
         {
             Vector3 l = transform.lossyScale;
@@ -436,10 +494,13 @@ namespace HangingHammock
             if (held)
             {
                 ResetParts();
-                if (canHang) DrawPreview(); else SetRopesVisible(false);
+                if (canHang && EnsureTwin()) DrawPreview(); else SetRopesVisible(false);
                 return;
             }
             if (!IsHung) { ResetParts(); SetRopesVisible(false); return; }
+
+            if (anchorsDirty) ComputeHungAnchors();
+            else if (anchorRecheckAt > 0f && Time.time >= anchorRecheckAt) { anchorRecheckAt = 0f; ComputeHungAnchors(); }
 
             Vector3 pivotL = new Vector3(bCenter.x, Top + ropeLength, bCenter.z);
             Vector3 pivotW = transform.TransformPoint(pivotL);
@@ -457,18 +518,17 @@ namespace HangingHammock
             }
             partsDirty = true;
 
-            float ceilY = Top + ropeLength;
+            Vector3 sideW = transform.TransformDirection(S * axisA);
             for (int i = 0; i < 2; i++)
             {
                 float sign = i == 0 ? -1f : 1f;
                 Vector3 e = EndLocal(sign);
                 Vector3 bottom = transform.TransformPoint(pivotL + S * (e - pivotL));
-                Vector3 top = transform.TransformPoint(TopAnchor(e, sign, ceilY));
-                ropes[i].Set(top, bottom);
+                Vector3 top = transform.TransformPoint(topL[i]);
+                ropes[i].Set(top, bottom, sideW);
             }
         }
 
-        /// Коллайдер самого предмета — только для прицела/клика (с игроком не сталкивается)
         private void UpdateCollider()
         {
             if (box == null || bundleRenderers.Length == 0) return;
@@ -594,7 +654,7 @@ namespace HangingHammock
 
         private void ResetSwing() { phi = psi = phiVel = psiVel = 0f; hasPrev = false; pivotAcc = prevPivotVel = Vector3.zero; }
 
-        // ????????? верёвки ?????????
+        // ????????? концы и верёвки ?????????
         private Vector3 EndLocal(float sign)
         {
             if (hasEnds) return sign < 0f ? endA : endB;
@@ -602,7 +662,7 @@ namespace HangingHammock
             return new Vector3(bCenter.x, Top, bCenter.z) + axisA * (sign * half * 0.95f);
         }
 
-        /// Точка крепления на потолке: над концом гамака, разнесена наружу под углом
+        /// Расчётная точка на потолке: над концом, разведённая наружу на угол RopeAngle
         private Vector3 TopAnchor(Vector3 e, float sign, float ceilY)
         {
             float vert = Mathf.Max(0.02f, ceilY - e.y);
@@ -610,14 +670,25 @@ namespace HangingHammock
             return new Vector3(e.x, ceilY, e.z) + axisA * (sign * spread);
         }
 
+        /// Превью: виртуальный «ровный» гамак в точке, где он сейчас в руках (физ. пространство),
+        /// лучи ищут потолок, результат переводится обратно в видимый корабль
         private void DrawPreview()
         {
+            Vector3 origin = ToPhys(transform.position);
+            Quaternion physRot = ToPhys(transform.rotation);
+            Vector3 fwd = Vector3.ProjectOnPlane(physRot * Vector3.forward, Vector3.up);
+            if (fwd.sqrMagnitude < 1e-4f) fwd = Vector3.ProjectOnPlane(physRot * Vector3.up, Vector3.up);
+            if (fwd.sqrMagnitude < 1e-4f) { SetRopesVisible(false); return; }
+            Matrix4x4 m = Matrix4x4.TRS(origin, Quaternion.LookRotation(fwd.normalized, Vector3.up), Vector3.one);
+
+            Vector3 sideW = transform.TransformDirection(axisA);
             for (int i = 0; i < 2; i++)
             {
                 float sign = i == 0 ? -1f : 1f;
                 Vector3 e = EndLocal(sign);
                 float ceilY = Mathf.Max(e.y + 0.05f, probeUp);
-                ropes[i].Set(transform.TransformPoint(TopAnchor(e, sign, ceilY)), transform.TransformPoint(e));
+                Vector3 top = ToItem(FindAnchor(m, e, TopAnchor(e, sign, ceilY)));
+                ropes[i].Set(top, transform.TransformPoint(e), sideW);
             }
         }
 
@@ -666,6 +737,7 @@ namespace HangingHammock
             SetHungPhysics(true);
             IsHung = true;
             ResetSwing();
+            MarkAnchorsDirty(1f);
             Plugin.Log.LogInfo($"Restored hung hammock {k}, rope {ropeLength:0.00}");
         }
 
