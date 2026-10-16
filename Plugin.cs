@@ -31,9 +31,10 @@ namespace HangingHammock
         internal static ConfigEntry<KeyCode> ModeKey, RaiseKey, LowerKey;
         internal static ConfigEntry<bool> UseMouseWheel;
         internal static ConfigEntry<float> RopeAngle;
-        internal static ConfigEntry<bool> EnableSwing, FreezeSwingInBed, SolidWhenHung;
+        internal static ConfigEntry<bool> EnableSwing, FreezeSwingInBed, SolidWhenHung, ShowHooks;
         internal static ConfigEntry<bool> ShopEnable;
         internal static ConfigEntry<int> PrefabIndex;
+		internal static ConfigEntry<bool> DetailedRopeTexture;
 
         private float buildTimer;
 
@@ -52,12 +53,15 @@ namespace HangingHammock
             FreezeSwingInBed = Config.Bind("2 Hammock", "FreezeSwingInBed", false, "Stop swinging while you lie in the hammock (against motion sickness)");
             SolidWhenHung    = Config.Bind("2 Hammock", "SolidWhenHung", false,
                 "false = you and items pass through a hung hammock. true = it has a collider fitted to its shape (items can rest on it)");
+			ShowHooks = Config.Bind("2 Hammock", "ShowHooks", true, "Show iron hooks on the ceiling where the ropes attach");
 
             ShopEnable  = Config.Bind("3 General", "SellInShops", true, "Sell hammocks at furniture shops");
             PrefabIndex = Config.Bind("3 General", "PrefabIndex", 900,
-                "Item index in the prefab directory. Change only on conflict with another item mod, and NEVER after hammocks exist in your save");
+            "Item index in the prefab directory. Change only on conflict with another item mod, and NEVER after hammocks exist in your save");
 
             Log.LogInfo($"{NAME} {VERSION} loaded");
+			DetailedRopeTexture = Config.Bind("2 Hammock", "DetailedRopeTexture", false,
+			"false = smooth vanilla Sailwind style rope. true = detailed procedural twisted fiber texture");
         }
 
         private void Update()
