@@ -69,6 +69,7 @@ Hammocks are stored in your save as a modded item. Before removing the mod, **se
 
 ## Compatibility
 
+- Includes Harmony patch that makes Virtual Crew NPCs swing around in a hammock.
 - Uses its own item index (`900`). If another mod adds items at the same index, the log will show an error — change `PrefabIndex` in the config **before** buying any hammocks.
 - Does not modify vanilla items or ships. The hammock model is cloned from the vanilla ship hammock at runtime.
 
