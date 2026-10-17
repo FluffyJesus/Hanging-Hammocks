@@ -1,15 +1,16 @@
+using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Reflection;
+using HarmonyLib;
 using UnityEngine;
 
 namespace HangingHammock
 {
-    // Порядок 10000: наши Update/FixedUpdate/LateUpdate идут после обновления ItemRigidbody
     [DefaultExecutionOrder(10000)]
     public class HammockHanger : MonoBehaviour
     {
-        // Геометрические параметры, назначаемые при Instantiate
         public Vector3 bCenter;
         public Vector3 bExt;
         public Transform[] swingParts;
@@ -34,14 +35,13 @@ namespace HangingHammock
         private BoxCollider box;
         private bool scaleLogged;
 
-        // Коллайдеры двойника (ItemRigidbody.AddCollider вешает их около ~3 шт. назад)
         private Collider[] twinCols;
         private BoxCollider twinBox;
         private Vector3 twinBoxOrigSize, twinBoxOrigCenter;
         private bool twinBoxResized;
         private float colGraceUntil;
 
-        private Vector3 axisA, axisT;
+        public Vector3 axisA, axisT;
         private Vector3[] restPos;
         private Quaternion[] restRot;
         private bool partsDirty;
@@ -69,18 +69,18 @@ namespace HangingHammock
 
         private RopeVisual[] ropes;
 
-        // Точки крепления к потолку (локально, в системе твина). Считаем только при необходимости
         private readonly Vector3[] topL = new Vector3[2];
-        private readonly Vector3[] topN = new Vector3[2];   // Нормали потолка в точках крепления (локально, в твине)
+        private readonly Vector3[] topN = new Vector3[2];
         private bool anchorsDirty = true;
         private float anchorRecheckAt;
 
         private float Top => bCenter.y + bExt.y;
         private float Height => 2f * bExt.y;
 
-        // ????????? init ?????????
         private void Start()
         {
+            VirtualCrewPatch.TryPatch();
+
             item = GetComponent<ShipItem>();
             rootRenderer = GetComponent<Renderer>();
             box = GetComponent<BoxCollider>();
@@ -124,7 +124,6 @@ namespace HangingHammock
             twinC.inStove = false;
         }
 
-        // ????????? перевод позиций предмет <-> физический двойник (walkCol) ?????????
         private bool OnBoat(out Transform boat, out Transform walk)
         {
             boat = item != null ? item.currentActualBoat : null;
@@ -142,7 +141,6 @@ namespace HangingHammock
         private Quaternion ToPhys(Quaternion q) =>
             OnBoat(out var b, out var w) ? w.rotation * Quaternion.Inverse(b.rotation) * q : q;
 
-        // ????????? управление коллайдерами ?????????
         private void ManageTwinColliders()
         {
             if (twin == null) return;
@@ -183,9 +181,10 @@ namespace HangingHammock
             twinBoxResized = false;
         }
 
-        // ????????? Update ?????????
         private void Update()
         {
+            VirtualCrewPatch.TryPatch();
+
             if (item == null || !EnsureTwin()) return;
             aliveTime += Time.unscaledDeltaTime;
 
@@ -258,7 +257,6 @@ namespace HangingHammock
             pinParent = twin.parent; pinPos = twin.localPosition; pinRot = twin.localRotation; pinTimer = seconds;
         }
 
-        // ????????? лучи ?????????
         internal static bool CastStatic(Vector3 origin, Vector3 dir, float max, out RaycastHit best, float minDist = 0f)
         {
             best = default;
@@ -363,6 +361,7 @@ namespace HangingHammock
             ResetSwing();
             MarkAnchorsDirty(0.75f);
             Save();
+            VirtualCrewPatch.RegisterHammock(this);
             UISoundPlayer.instance.PlayUISound(UISounds.winchUnclick, 1f, 0.6f);
             Notify("Hammock hung");
         }
@@ -381,10 +380,10 @@ namespace HangingHammock
             anchorsDirty = true;
             anchorRecheckAt = 0f;
             partsDirty = true;
+            VirtualCrewPatch.UnregisterHammock(this);
             ResetParts();
         }
 
-        // ????????? снятие ?????????
         private bool HandleTakeDown()
         {
             if (GameState.inBed != null || GameState.inCursorMenu || !item.IsLookedAt()
@@ -434,7 +433,6 @@ namespace HangingHammock
             return best;
         }
 
-        // ????????? высота ?????????
         private void HandleHeightInput()
         {
             if (GameState.inBed != null || GameState.inCursorMenu) return;
@@ -475,7 +473,6 @@ namespace HangingHammock
             Notify("Rope: " + ropeLength.ToString("0.00", CI) + " m");
         }
 
-        // ????????? визуал, качание, верёвки ?????????
         private Vector3 RestPos(int i) =>
             i == 0 ? restPos[0] + Vector3.up * Tuning.SleepOffset : restPos[i];
 
@@ -510,7 +507,6 @@ namespace HangingHammock
             if (anchorsDirty) ComputeHungAnchors();
             else if (anchorRecheckAt > 0f && Time.time >= anchorRecheckAt) { anchorRecheckAt = 0f; ComputeHungAnchors(); }
 
-            // Строгая ось вращения: проходит через обе точки подвеса к потолку
             Vector3 pivotL = (topL[0] + topL[1]) * 0.5f;
             Vector3 swingAxisL = (topL[1] - topL[0]).normalized;
             if (swingAxisL.sqrMagnitude < 1e-4f) swingAxisL = axisA;
@@ -520,7 +516,6 @@ namespace HangingHammock
             if (freeze) { phi = phiVel = 0f; hasPrev = false; }
             else Simulate(Time.deltaTime, transform.rotation, pivotW, ropeLength + bExt.y);
 
-            // Вращение происходит строго вокруг линии крюков -> длина верёвок абсолютно фиксирована
             Quaternion S = Quaternion.AngleAxis(phi, swingAxisL);
             for (int i = 0; i < swingParts.Length; i++)
             {
@@ -660,7 +655,6 @@ namespace HangingHammock
 
         private void ResetSwing() { phi = phiVel = 0f; hasPrev = false; pivotAcc = prevPivotVel = Vector3.zero; }
 
-        // ????????? концы и подвес ?????????
         private Vector3 EndLocal(float sign)
         {
             if (hasEnds) return sign < 0f ? endA : endB;
@@ -707,11 +701,11 @@ namespace HangingHammock
 
         private void OnDestroy()
         {
+            VirtualCrewPatch.UnregisterHammock(this);
             if (ropes == null) return;
             foreach (var r in ropes) r?.Destroy();
         }
 
-        // ????????? сохранение ?????????
         private string Key()
         {
             var sp = GetComponent<SaveablePrefab>();
@@ -743,12 +737,205 @@ namespace HangingHammock
             IsHung = true;
             ResetSwing();
             MarkAnchorsDirty(1f);
+            VirtualCrewPatch.RegisterHammock(this);
             Plugin.Log.LogInfo($"Restored hung hammock {k}, rope {ropeLength:0.00}");
         }
 
         internal static void Notify(string msg)
         {
             if (NotificationUi.instance != null) NotificationUi.instance.ShowNotification(msg);
+        }
+
+        // ????????? ѕолна€ интеграци€ с Virtual Crew (без вил€ни€ ног!) ?????????
+        public static class VirtualCrewPatch
+        {
+            private static bool isPatched;
+            private static readonly List<HammockHanger> HungHammocks = new List<HammockHanger>();
+
+            private static FieldInfo contextField;
+            private static PropertyInfo worldBoatProp;
+            private static FieldInfo actorsField;
+            private static FieldInfo bodyLyingField;
+            private static FieldInfo headLocalField;
+            private static FieldInfo alongLocalField;
+            private static FieldInfo upLocalField;
+
+            public static void RegisterHammock(HammockHanger h)
+            {
+                if (h != null && !HungHammocks.Contains(h)) HungHammocks.Add(h);
+            }
+
+            public static void UnregisterHammock(HammockHanger h)
+            {
+                if (h != null) HungHammocks.Remove(h);
+            }
+
+            public static void TryPatch()
+            {
+                if (isPatched) return;
+
+                try
+                {
+                    Assembly vcAsm = null;
+                    foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        if (string.Equals(a.GetName().Name, "SailwindVirtualCrew", StringComparison.OrdinalIgnoreCase))
+                        {
+                            vcAsm = a;
+                            break;
+                        }
+                    }
+
+                    if (vcAsm == null) return;
+
+                    var harmony = new Harmony("HangingHammock.VirtualCrewIntegration");
+
+                    // 1. «ащита от выкидывани€ из кровати
+                    Type locatorType = vcAsm.GetType("SailwindVirtualCrew.LocatorUtils");
+                    if (locatorType != null)
+                    {
+                        MethodInfo bedCheckMethod = locatorType.GetMethod("IsBedStillOnBoat", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (bedCheckMethod != null)
+                        {
+                            var checkPrefix = typeof(VirtualCrewPatch).GetMethod(nameof(IsBedStillOnBoatPrefix), BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                            harmony.Patch(bedCheckMethod, prefix: new HarmonyMethod(checkPrefix));
+                        }
+                    }
+
+                    // 2. —инхронизаци€ качани€ тела
+                    Type coordType = vcAsm.GetType("SailwindVirtualCrew.CrewNavigationCoordinator");
+                    if (coordType != null)
+                    {
+                        MethodInfo tickMethod = coordType.GetMethod("Tick", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+                        if (tickMethod != null)
+                        {
+                            var tickPrefix = typeof(VirtualCrewPatch).GetMethod(nameof(TickPrefix), BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                            harmony.Patch(tickMethod, prefix: new HarmonyMethod(tickPrefix));
+                        }
+                    }
+
+                    isPatched = true;
+                }
+                catch
+                {
+                }
+            }
+
+            public static bool IsBedStillOnBoatPrefix(Component bed, ref bool __result)
+            {
+                if (bed == null) return true;
+                HammockHanger hanger = bed.GetComponent<HammockHanger>() ?? bed.GetComponentInParent<HammockHanger>();
+                if (hanger != null && hanger.IsHung)
+                {
+                    __result = true;
+                    return false;
+                }
+                return true;
+            }
+
+            public static void TickPrefix(object __instance)
+            {
+                if (__instance == null || HungHammocks.Count == 0) return;
+
+                try
+                {
+                    Type coordType = __instance.GetType();
+
+                    if (contextField == null)
+                        contextField = coordType.GetField("_context", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    if (contextField == null) return;
+                    object ctx = contextField.GetValue(__instance);
+                    if (ctx == null) return;
+
+                    if (worldBoatProp == null)
+                        worldBoatProp = ctx.GetType().GetProperty("WorldBoat", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    Transform worldBoat = worldBoatProp != null ? worldBoatProp.GetValue(ctx, null) as Transform : null;
+                    if (worldBoat == null) return;
+
+                    if (actorsField == null)
+                    {
+                        actorsField = coordType.GetField("_actorsByCrew", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                                   ?? coordType.GetField("_actorsByOwner", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    }
+                    if (actorsField == null) return;
+
+                    var dict = actorsField.GetValue(__instance) as IDictionary;
+                    if (dict == null || dict.Count == 0) return;
+
+                    foreach (DictionaryEntry entry in dict)
+                    {
+                        object actor = entry.Value;
+                        if (actor == null) continue;
+
+                        Type actorType = actor.GetType();
+
+                        if (bodyLyingField == null)
+                            bodyLyingField = actorType.GetField("_bodyLying", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (bodyLyingField == null) continue;
+
+                        bool isLying = (bool)bodyLyingField.GetValue(actor);
+                        if (!isLying) continue;
+
+                        if (headLocalField == null)
+                            headLocalField = actorType.GetField("_bodyLieHeadLocal", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (headLocalField == null) continue;
+
+                        Vector3 currentHeadLocal = (Vector3)headLocalField.GetValue(actor);
+                        Vector3 currentHeadWorld = worldBoat.TransformPoint(currentHeadLocal);
+
+                        HammockHanger targetHammock = null;
+                        float bestDist = 2.5f;
+
+                        for (int i = 0; i < HungHammocks.Count; i++)
+                        {
+                            var h = HungHammocks[i];
+                            if (h == null || !h.IsHung || h.swingParts == null || h.swingParts.Length == 0 || h.swingParts[0] == null)
+                                continue;
+
+                            float d = Vector3.Distance(currentHeadWorld, h.swingParts[0].position);
+                            if (d < bestDist)
+                            {
+                                bestDist = d;
+                                targetHammock = h;
+                            }
+                        }
+
+                        if (targetHammock == null) continue;
+
+                        Transform sleepT = targetHammock.swingParts[0];
+                        Vector3 eyes = sleepT.position;
+
+                        // 1. ѕродольна€ ось гамака (—“–ќ√ќ вдоль полотна, исключает любые вил€ни€ ног в стороны!)
+                        Vector3 longAxisW = targetHammock.transform.TransformDirection(targetHammock.axisA);
+                        Vector3 toHeadW = Vector3.Project(eyes - targetHammock.transform.position, longAxisW).normalized;
+                        if (toHeadW.sqrMagnitude < 0.01f) toHeadW = longAxisW;
+                        Vector3 toFeetW = -toHeadW;
+
+                        Vector3 alongLocal = worldBoat.InverseTransformDirection(toFeetW);
+                        Vector3 headLocal = worldBoat.InverseTransformPoint(eyes - worldBoat.up * 0.08f + toHeadW * 0.03f);
+
+                        // 2.  рен корпуса вместе с наклоном полотна гамака
+                        Vector3 swingAxisL = (targetHammock.topL[1] - targetHammock.topL[0]).normalized;
+                        if (swingAxisL.sqrMagnitude < 1e-4f) swingAxisL = targetHammock.axisA;
+                        Quaternion S = Quaternion.AngleAxis(targetHammock.phi, swingAxisL);
+                        Vector3 clothUpW = targetHammock.transform.TransformDirection(S * Vector3.up);
+                        Vector3 upLocal = worldBoat.InverseTransformDirection(clothUpW);
+
+                        if (alongLocalField == null)
+                            alongLocalField = actorType.GetField("_bodyLieAlongLocal", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (upLocalField == null)
+                            upLocalField = actorType.GetField("_bodyLieUpLocal", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+                        // ѕримен€ем выверенные координаты
+                        headLocalField.SetValue(actor, headLocal);
+                        if (alongLocalField != null) alongLocalField.SetValue(actor, alongLocal);
+                        if (upLocalField != null) upLocalField.SetValue(actor, upLocal);
+                    }
+                }
+                catch
+                {
+                }
+            }
         }
     }
 }
