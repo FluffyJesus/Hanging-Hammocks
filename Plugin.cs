@@ -24,7 +24,7 @@ namespace HangingHammock
     {
         public const string GUID = "fluffyjesus.sailwind.hanginghammock";
         public const string NAME = "Hanging Hammock";
-        public const string VERSION = "1.0.0";
+        public const string VERSION = "1.1";
 
         internal static ManualLogSource Log;
 
