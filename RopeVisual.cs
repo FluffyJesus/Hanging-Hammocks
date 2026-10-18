@@ -17,6 +17,12 @@ namespace HangingHammock
         private static MaterialPropertyBlock mpb;
         private static readonly int MainTexST = Shader.PropertyToID("_MainTex_ST");
         private const float RopeStart = 0.9f;
+        // Толщина верёвки = толщина «верёвки», из которой сделан узел (диаметр трубки витка: 2 * 0.19 в единицах узла)
+        private const float KnotRopeRatio = 0.38f;
+        // Насколько «подтянут» узел: радиус витков умножается на это число (1 = как было, 0.8 = на 20% туже)
+        private const float KnotTighten = 0.8f;
+        // true, если верёвка использует тот же материал, что кольца свёртка (ванильный материал верёвки игры)
+        private static bool vanillaShared;
 
         private readonly GameObject ropeGo, knotGo, topKnotGo, hookGo;
         private readonly MeshRenderer ropeR, knotR, topKnotR;
@@ -110,14 +116,19 @@ namespace HangingHammock
             float rl = len - offB - offT - slack;
 
             ropeGo.transform.SetPositionAndRotation(bottom + dir * offB, Quaternion.FromToRotation(Vector3.up, dir));
-            ropeGo.transform.localScale = new Vector3(w, rl, w);
+            float rw = Mathf.Max(0.004f, KnotRopeRatio * ks);   // толщина верёвки = толщина верёвки узла
+            ropeGo.transform.localScale = new Vector3(rw, rl, rw);
 
             if (mpb == null) mpb = new MaterialPropertyBlock();
             ropeR.GetPropertyBlock(mpb);
             // Для детализированной текстуры используем тайлинг витков, для ванильной — 1:1
-            float vTiling = lastDetailedState ? (rl / (w * 3f)) : 1f;
-            mpb.SetVector(MainTexST, new Vector4(1f, vTiling, 0f, 0f));
-            ropeR.SetPropertyBlock(mpb);
+            float vTiling = lastDetailedState ? (rl / (rw * 3f)) : 1f;
+            // у общего ванильного материала оставляем его собственный тайлинг
+            if (!(vanillaShared && !lastDetailedState))
+            {
+                mpb.SetVector(MainTexST, new Vector4(1f, vTiling, 0f, 0f));
+                ropeR.SetPropertyBlock(mpb);
+            }
 
             Vector3 fwd = Vector3.ProjectOnPlane(side, dir);
             if (fwd.sqrMagnitude < 1e-6f) fwd = Vector3.ProjectOnPlane(Vector3.forward, dir);
@@ -193,13 +204,13 @@ namespace HangingHammock
 
             AddTeardrop(v, n, uv, t, -0.5f, 0.95f, 0.36f, 0.17f, 32, 8);
             AddTorus(v, n, uv, t, Matrix4x4.TRS(new Vector3(0f, 1.0f, 0f), Quaternion.Euler(6f, 0f, 0f), Vector3.one),
-                     0.42f, 0.27f, 16, 8);
+                     0.42f * KnotTighten, 0.27f, 16, 8);
             for (int k = 0; k < 3; k++)
             {
                 float tilt = (k % 2 == 0) ? 9f : -9f;
                 AddTorus(v, n, uv, t,
                          Matrix4x4.TRS(new Vector3(0f, 1.38f + 0.3f * k, 0f), Quaternion.Euler(tilt, k * 40f, 0f), Vector3.one),
-                         0.5f, 0.19f, 16, 6);
+                         0.5f * KnotTighten, 0.19f, 16, 6);
             }
 
             knotMesh = new Mesh { name = "hammock_rope_knot" };
@@ -320,6 +331,16 @@ namespace HangingHammock
             else
             {
                 if (vanillaMaterial != null) return vanillaMaterial;
+
+                // Тот же материал, что у колец свёртка (ванильная верёвка игры)
+                var shared = HammockFactory.FindVanillaRopeMaterial();
+                if (shared != null)
+                {
+                    vanillaMaterial = shared;
+                    vanillaShared = true;
+                    return vanillaMaterial;
+                }
+
                 vanillaMaterial = CreateBaseMaterial(hammockMat);
                 vanillaMaterial.name = "hammock_rope_vanilla";
                 vanillaMaterial.mainTexture = MakeVanillaTexture();

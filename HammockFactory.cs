@@ -27,9 +27,24 @@ namespace HangingHammock
         private const float SeamTwist   = 0.6f;    // radians; how much the outer seam spirals along the length
         private const int   CapRings    = 100;     // radial resolution of the end faces
 
+        // --- UV / textures ---
+        private const float CapTexRadius     = BundleRadius;   // world radius covered by the end-face texture
+
+        // --- hammock cloth: new UV + pleats where the cloth gathers into the rope ---
+        private const int   HammockFolds     = 8;       // pleats across the width at each end
+        private const float HammockFoldZone  = 0.18f;   // share of the length (from each end) covered by the pleats
+        private const float HammockFoldShade = 0.30f;   // depth of the pleat creases
+        private const int   HammockBins      = 48;      // outline sampling along the long axis for the UV mapping
+
+        // --- painted folds (baked into the side texture) ---
+        private const float FoldShade     = 0.08f;   // strength of the broad lengthwise folds
+        private const float TensionShade  = 0.12f;   // strength of the small creases fanning out from each rope
+        private const int   TensionWaves  = 6;      // creases around the circumference (integer, otherwise the texture has a seam)
+        private const float TensionSpread = 0.06f;   // how far (meters) the creases reach from a rope
+
         // --- dents under the ropes ---
         private const float DentDepth     = 0.005f;  // how deep the cloth is pressed in under a rope
-        private const float DentWidth     = 0.02f;  // softness/width of the dent in meters (gaussian)
+        private const float DentWidth     = 0.02f;   // softness/width of the dent in meters (gaussian)
         private const float DentVariation = 0.2f;    // 0..1, uneven pull around the circumference
 
         private const int RadialSeg = 48, LengthSeg = 48, RopeRingSeg = 28, RopeTubeSeg = 6;
@@ -42,6 +57,7 @@ namespace HangingHammock
         // false = clean vanilla-style grain on the rings, true = strands and fibers
         private const bool DetailedRope = false;
         private const float RopeUVTiling = 8f;   // how many times the rope texture repeats around one ring
+        private const bool  RopeUVSwap   = false; // set to true if the vanilla rope texture runs the wrong way (strands across instead of along the ring)
 
         public static GameObject Prefab;
         public static int Index = -1;
@@ -51,7 +67,8 @@ namespace HangingHammock
 
         private static GameObject holder;
         private static bool warnedSource, warnedTemplate;
-        private static Texture2D grainTex, strandTex;
+        private static Texture2D grainTex, strandTex, sideTex, capTex, hammockTex;
+        private static bool loggedMat;
 
         public static void TryBuild()
         {
@@ -193,6 +210,10 @@ namespace HangingHammock
             Vector3 O = bb.center;
             Vector3 axis = bb.extents.x >= bb.extents.z ? Vector3.right : Vector3.forward;
 
+            // new UV for the hammock cloth (only possible when the mesh is readable)
+            if (readable)
+                RemapHammockUV(mesh, M, O, axis, axis == Vector3.right ? bb.extents.x : bb.extents.z);
+
             bool hasEnds = false; Vector3 endA = Vector3.zero, endB = Vector3.zero;
             if (readable && pts.Count > 0)
             {
@@ -230,6 +251,7 @@ namespace HangingHammock
             {
                 var sm = srcR.sharedMaterials;
                 if (!readable) sm = ModelTweaks.TryCullOff(sm);
+                else sm = HammockClothMaterials(sm, mesh.subMeshCount);
                 vr.sharedMaterials = sm;
                 vr.shadowCastingMode = srcR.shadowCastingMode;
                 vr.receiveShadows = srcR.receiveShadows;
@@ -307,6 +329,122 @@ namespace HangingHammock
             return c > 0 ? sum / c : Vector3.zero;
         }
 
+        // ========= hammock cloth =========
+        // Same color as the bundle cloth, with our own texture instead of the Dhow atlas.
+        private static Material[] HammockClothMaterials(Material[] src, int subMeshes)
+        {
+            var tex = MakeHammockTexture();
+            int n = Mathf.Max(1, subMeshes);
+            var res = new Material[n];
+            var names = new List<string>();
+            for (int i = 0; i < n; i++)
+            {
+                Material b = (src != null && src.Length > 0) ? src[Mathf.Min(i, src.Length - 1)] : null;
+                res[i] = MakeMat(b, ClothColor, tex);
+                names.Add(b != null ? b.name : "null");
+            }
+            Plugin.Log.LogInfo("Hammock cloth: " + n + " submesh(es), source materials: " + string.Join(", ", names.ToArray()));
+            return res;
+        }
+
+        // New UVs for the hammock mesh: u = position along the long axis (0..1),
+        // v = position across, normalized to the LOCAL width (0 and 1 are the two edges).
+        // Pleats painted at constant v therefore follow the outline and converge where the cloth narrows to the rope.
+        private static void RemapHammockUV(Mesh mesh, Matrix4x4 M, Vector3 O, Vector3 axis, float halfLen)
+        {
+            Vector3 across = axis == Vector3.right ? Vector3.forward : Vector3.right;
+            var verts = mesh.vertices;
+            int n = verts.Length, N = HammockBins;
+            halfLen = Mathf.Max(1e-3f, halfLen);
+
+            var s01 = new float[n];
+            var cc  = new float[n];
+            var lo  = new float[N];
+            var hi  = new float[N];
+            for (int i = 0; i < N; i++) { lo[i] = float.MaxValue; hi[i] = float.MinValue; }
+
+            for (int i = 0; i < n; i++)
+            {
+                Vector3 pw = M.MultiplyPoint3x4(verts[i]) - O;
+                s01[i] = Mathf.Clamp01((Vector3.Dot(pw, axis) + halfLen) / (2f * halfLen));
+                cc[i] = Vector3.Dot(pw, across);
+                int b = Mathf.Min(N - 1, (int)(s01[i] * N));
+                if (cc[i] < lo[b]) lo[b] = cc[i];
+                if (cc[i] > hi[b]) hi[b] = cc[i];
+            }
+
+            // the vanilla mesh is low-poly: some bins may be empty, fill them from the nearest filled ones
+            var ok = new bool[N];
+            for (int i = 0; i < N; i++) ok[i] = lo[i] <= hi[i];
+            for (int i = 0; i < N; i++)
+            {
+                if (ok[i]) continue;
+                int l = i - 1; while (l >= 0 && !ok[l]) l--;
+                int r = i + 1; while (r < N && !ok[r]) r++;
+                if (l < 0 && r >= N) { lo[i] = -0.5f; hi[i] = 0.5f; }
+                else if (l < 0)      { lo[i] = lo[r]; hi[i] = hi[r]; }
+                else if (r >= N)     { lo[i] = lo[l]; hi[i] = hi[l]; }
+                else
+                {
+                    float tt = (i - l) / (float)(r - l);
+                    lo[i] = Mathf.Lerp(lo[l], lo[r], tt);
+                    hi[i] = Mathf.Lerp(hi[l], hi[r], tt);
+                }
+            }
+
+            var uv = new Vector2[n];
+            for (int i = 0; i < n; i++)
+            {
+                float f = s01[i] * N - 0.5f;
+                int i0 = Mathf.Clamp(Mathf.FloorToInt(f), 0, N - 1);
+                int i1 = Mathf.Min(i0 + 1, N - 1);
+                float tt = Mathf.Clamp01(f - i0);
+                float a = Mathf.Lerp(lo[i0], lo[i1], tt), b = Mathf.Lerp(hi[i0], hi[i1], tt);
+                float mid = (a + b) * 0.5f, half = Mathf.Max(1e-3f, (b - a) * 0.5f);
+                float cn = Mathf.Clamp((cc[i] - mid) / half, -1f, 1f);
+                uv[i] = new Vector2(s01[i], cn * 0.5f + 0.5f);
+            }
+            mesh.uv = uv;
+        }
+
+        // Hammock texture: u = along the hammock, v = across (edge to edge). Not tiled.
+        // Near both ends HammockFolds pleats gather toward the rope; the rest is almost flat.
+        private static Texture2D MakeHammockTexture()
+        {
+            if (hammockTex != null) return hammockTex;
+            const int W = 512, H = 256;
+            hammockTex = new Texture2D(W, H, TextureFormat.RGBA32, true)
+            { name = "hammock_cloth_tex", wrapMode = TextureWrapMode.Clamp, anisoLevel = 4 };
+            var px = new Color[W * H];
+            for (int y = 0; y < H; y++)
+            {
+                float c = (y + 0.5f) / H;                  // 0..1 across, edge to edge
+                float edge = Mathf.Abs(c * 2f - 1f);       // 0 in the middle, 1 at the edges
+                for (int x = 0; x < W; x++)
+                {
+                    float s = (x + 0.5f) / W;                              // 0..1 along
+                    float dEnd = Mathf.Min(s, 1f - s) / HammockFoldZone;   // 0 at the end, 1 at the border of the zone
+                    float env = 1f - Sm(0f, 1f, dEnd);                     // 1 at the end, 0 away from it
+
+                    // creases sit between the edges (at half-integers of p), slightly irregular
+                    float p = c * HammockFolds + 0.12f * Mathf.Sin(dEnd * 9f + c * 11f) + 0.10f * Mathf.Sin(c * 23f + s * 5f);
+                    float crease = 0.5f - 0.5f * Mathf.Cos(p * Mathf.PI * 2f);
+                    crease *= crease;                                      // narrower dark lines
+                    float ridge = 1f - crease;
+
+                    float val = 0.97f - HammockFoldShade * env * crease + 0.03f * env * ridge;
+                    val *= 1f - 0.20f * env * env * env;                   // darker where the cloth is gathered into the rope
+                    val *= 1f - 0.10f * Sm(0.85f, 1f, edge);               // slightly darker along the outline
+                    val *= 1f + 0.03f * Mathf.Sin(c * 7f + 2.5f * Mathf.Sin(s * 4f));   // very soft broad folds
+                    val = Mathf.Clamp01(val);
+                    px[y * W + x] = new Color(val, val, val, 1f);
+                }
+            }
+            hammockTex.SetPixels(px);
+            hammockTex.Apply(true);
+            return hammockTex;
+        }
+
         // ========= procedural bundle =========
         private static List<Renderer> BuildBundle(GameObject go, MeshRenderer hammockSrc, out Bounds bounds)
         {
@@ -323,23 +461,72 @@ namespace HangingHammock
             Mesh cloth = BuildClothMesh();
             Mesh rope  = BuildRopeMesh();
 
-            res.Add(AddPart(root, "bundle_cloth", cloth, MakeMat(baseMat, ClothColor, MakeGrainTexture()), go.layer));
-            res.Add(AddPart(root, "bundle_rope",  rope,  MakeMat(baseMat, RopeColor,
-                DetailedRope ? MakeStrandTexture() : MakeGrainTexture()), go.layer));
+            // cloth has two submeshes: [0] side + seam (baked relief shading), [1] end faces (spiral shading)
+            res.Add(AddPart(root, "bundle_cloth", cloth, go.layer,
+                MakeMat(baseMat, ClothColor, MakeSideTexture()),
+                MakeMat(baseMat, ClothColor, MakeCapTexture())));
+            // Rings use the vanilla rope material (the one of the cloth rope prefab); our own color is only a fallback
+            Material ropeMat = FindVanillaRopeMaterial();
+            if (ropeMat != null)
+            {
+                var mt = ropeMat.mainTexture;
+                Plugin.Log.LogInfo("Bundle rope uses vanilla material '" + ropeMat.name + "', shader '" + ropeMat.shader.name +
+                                   "', main texture: " + (mt != null ? mt.name + " " + mt.width + "x" + mt.height : "none"));
+            }
+            else
+            {
+                Plugin.Log.LogWarning("Vanilla rope material not found, rings use RopeColor");
+                ropeMat = MakeMat(baseMat, RopeColor, DetailedRope ? MakeStrandTexture() : MakeGrainTexture());
+            }
+            res.Add(AddPart(root, "bundle_rope", rope, go.layer, ropeMat));
 
             bounds = cloth.bounds;
             bounds.Encapsulate(rope.bounds);
             return res;
         }
 
-        private static Renderer AddPart(Transform root, string name, Mesh mesh, Material mat, int layer)
+        // Material of the vanilla rope: first the skinned cloth rope prefab, then the LineRenderer of any RopeEffect in the scene.
+        // The prefab field is read through reflection, so it compiles even if the field is not public.
+        internal static Material FindVanillaRopeMaterial()
+        {
+            try
+            {
+                var refs = RefsDirectory.instance;
+                if (refs != null)
+                {
+                    var f = typeof(RefsDirectory).GetField("clothRopePrefab",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                    var prefab = f != null ? f.GetValue(refs) as GameObject : null;
+                    if (prefab != null)
+                    {
+                        var cr = prefab.GetComponent<ClothRope>();
+                        SkinnedMeshRenderer smr = cr != null ? cr.skinned : null;
+                        if (smr == null) smr = prefab.GetComponentInChildren<SkinnedMeshRenderer>(true);
+                        if (smr != null && smr.sharedMaterial != null) return smr.sharedMaterial;
+                    }
+                }
+                foreach (var re in Resources.FindObjectsOfTypeAll<RopeEffect>())
+                {
+                    if (re == null) continue;
+                    var lr = re.GetComponent<LineRenderer>();
+                    if (lr != null && lr.sharedMaterial != null) return lr.sharedMaterial;
+                }
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning("Vanilla rope material lookup failed: " + e.Message);
+            }
+            return null;
+        }
+
+        private static Renderer AddPart(Transform root, string name, Mesh mesh, int layer, params Material[] mats)
         {
             var t = new GameObject(name).transform;
             t.SetParent(root, false);
             t.gameObject.layer = layer;
             t.gameObject.AddComponent<MeshFilter>().sharedMesh = mesh;
             var r = t.gameObject.AddComponent<MeshRenderer>();
-            r.sharedMaterial = mat;
+            r.sharedMaterials = mats;
             return r;
         }
 
@@ -367,6 +554,23 @@ namespace HangingHammock
                 m.mainTextureOffset = Vector2.zero;
             }
             if (m.HasProperty("_BaseMap")) m.SetTexture("_BaseMap", tex);
+
+            // The base material comes from the Dhow atlas: its normal / detail / mask maps would be
+            // stretched over our UVs (looks like wood grain), so every slot except the main one is cleared.
+            var cleared = new List<string>();
+            foreach (var tn in m.GetTexturePropertyNames())
+            {
+                if (tn == "_MainTex" || tn == "_BaseMap") continue;
+                if (m.GetTexture(tn) == null) continue;
+                cleared.Add(tn);
+                m.SetTexture(tn, null);
+            }
+            if (!loggedMat && baseMat != null)
+            {
+                loggedMat = true;
+                Plugin.Log.LogInfo("Bundle material base '" + baseMat.name + "', shader '" + baseMat.shader.name +
+                                   "', cleared textures: " + (cleared.Count > 0 ? string.Join(", ", cleared.ToArray()) : "none"));
+            }
             return m;
         }
 
@@ -412,6 +616,72 @@ namespace HangingHammock
             return strandTex;
         }
 
+        // Side texture, not tiled: u = position along the roll, v = angle around it.
+        // It only emphasizes the relief (no pattern): darker around the rope dents, soft folds, shaded corner at the seam.
+        private static Texture2D MakeSideTexture()
+        {
+            if (sideTex != null) return sideTex;
+            const int W = 512, H = 256;
+            sideTex = new Texture2D(W, H, TextureFormat.RGBA32, true)
+            { name = "hammock_bundle_side_tex", wrapMode = TextureWrapMode.Clamp, anisoLevel = 4 };
+            const float TwoPi = Mathf.PI * 2f;
+            const float SeamSpan = 0.25f;   // radians before the seam step that get shaded
+            var px = new Color[W * H];
+            for (int y = 0; y < H; y++)
+            {
+                float a = (y + 0.5f) / H * TwoPi;
+                for (int x = 0; x < W; x++)
+                {
+                    float t = (x + 0.5f) / W;
+
+                    float dentAO  = Mathf.Clamp01(RopeDent(a, t) / DentDepth);          // 0 away from ropes, ~1 under them
+                    float fold    = (Wrinkle(a, t) - 1f) / 0.022f;                      // about -1..1, valleys are negative
+                    float seamOcc = 1f - Sm(0f, SeamSpan, TwoPi - a);                   // 1 right at the step, 0 away from it
+
+                    float tension = TensionWrinkles(a, t);                                    // about -1..1
+                    float val = Mathf.Clamp01((1f + FoldShade * fold + TensionShade * tension) * (1f - 0.30f * dentAO) * (1f - 0.25f * seamOcc));
+                    px[y * W + x] = new Color(val, val, val, 1f);
+                }
+            }
+            sideTex.SetPixels(px);
+            sideTex.Apply(true);
+            return sideTex;
+        }
+
+        // End-face texture: darkens the gaps between wraps (same spiral as the geometry in CapOffset)
+        // and gives every wrap a slightly different shade.
+        private static Texture2D MakeCapTexture()
+        {
+            if (capTex != null) return capTex;
+            const int S = 256;
+            capTex = new Texture2D(S, S, TextureFormat.RGBA32, true)
+            { name = "hammock_bundle_cap_tex", wrapMode = TextureWrapMode.Clamp, anisoLevel = 4 };
+            float rEnd = Profile(0f);
+            var px = new Color[S * S];
+            for (int y = 0; y < S; y++)
+                for (int x = 0; x < S; x++)
+                {
+                    float nx = (x + 0.5f) / S * 2f - 1f;
+                    float ny = (y + 0.5f) / S * 2f - 1f;
+                    float r = Mathf.Sqrt(nx * nx + ny * ny) * CapTexRadius;
+                    float a = Mathf.Atan2(ny, nx);
+                    if (a < 0f) a += Mathf.PI * 2f;
+
+                    float q = Mathf.Max(0f, (rEnd - r) / LayerPitch - a / (Mathf.PI * 2f));   // same spiral coordinate as CapOffset
+                    int k = Mathf.FloorToInt(q);
+                    float sp = q - k;
+                    float edge   = Mathf.Min(sp, 1f - sp);
+                    float crease = 1f - Sm(0f, 0.30f, edge);        // dark in the gap between wraps
+                    float tone   = 0.90f + 0.10f * Hash01(k);       // each wrap a slightly different shade
+
+                    float val = Mathf.Clamp01(tone * (1f - 0.5f * crease));
+                    px[y * S + x] = new Color(val, val, val, 1f);
+                }
+            capTex.SetPixels(px);
+            capTex.Apply(true);
+            return capTex;
+        }
+
         // Radius profile along the roll: t in [0..1]
         private static float Profile(float t)
         {
@@ -436,8 +706,32 @@ namespace HangingHammock
         // Radius shrinks by one LayerPitch per turn; at a=2PI it jumps back up (the seam step).
         private static float OuterR(float a, float t)
         {
-            float wrinkle = 1f + 0.012f * Mathf.Sin(a * 4f + t * 7f) + 0.008f * Mathf.Sin(a * 7f - t * 5f);
+            float wrinkle = Wrinkle(a, t);
             return (Profile(t) - LayerPitch * a / (Mathf.PI * 2f) - RopeDent(a, t)) * wrinkle;
+        }
+
+        private static float Wrinkle(float a, float t)
+        {
+            // Mostly lengthwise creases (a is multiplied by integers only, so the seam stays consistent);
+            // t only bends them slowly, no crossing diagonals.
+            return 1f + 0.014f * Mathf.Sin(a * 3f + 1.6f * Mathf.Sin(t * 2.1f + 0.7f))
+                      + 0.008f * Mathf.Sin(a * 5f - 2.0f * Mathf.Sin(t * 1.7f + 2.0f) + 1.1f);
+        }
+
+        // Small creases fanning out along the roll from each rope: strongest at the rope, fading away from it.
+        // Only integer multiples of a are used, so the texture closes at a=0 / a=2PI.
+        private static float TensionWrinkles(float a, float t)
+        {
+            float sum = 0f;
+            for (int k = 0; k < RopeAt.Length; k++)
+            {
+                float d = (t - RopeAt[k]) * BundleLength;
+                float env = Mathf.Exp(-(d * d) / (TensionSpread * TensionSpread));
+                if (env < 0.01f) continue;
+                float phase = a * TensionWaves + 1.4f * Mathf.Sin(a * 2f + k * 1.7f) + 18f * d * Mathf.Sin(a * 3f + k);
+                sum += env * Mathf.Sin(phase);
+            }
+            return Mathf.Clamp(sum, -1f, 1f);
         }
 
         // How far the cloth is pressed in at angle a / position t because of the rope rings.
@@ -476,20 +770,22 @@ namespace HangingHammock
             const float TwoPi = Mathf.PI * 2f;
             int seg = RadialSeg, rows = LengthSeg, stride = seg + 1;
             var verts = new List<Vector3>();
-            var tris  = new List<int>();
+            var uvs   = new List<Vector2>();
+            var sideTris = new List<int>();   // submesh 0: side + seam (relief texture)
+            var capTris  = new List<int>();   // submesh 1: end faces (spiral texture)
 
             Vector3 At(float px, float pr, float pa, float pt)
             {
                 float th = pa + SeamTwist * (pt - 0.5f);
                 return new Vector3(px, pr * Mathf.Cos(th), pr * Mathf.Sin(th));
             }
-            void Quad(int qa, int qb, int qc, int qd, bool flip)
+            void Quad(List<int> tl, int qa, int qb, int qc, int qd, bool flip)
             {
-                if (!flip) { tris.Add(qa); tris.Add(qb); tris.Add(qc); tris.Add(qb); tris.Add(qd); tris.Add(qc); }
-                else       { tris.Add(qa); tris.Add(qc); tris.Add(qb); tris.Add(qb); tris.Add(qc); tris.Add(qd); }
+                if (!flip) { tl.Add(qa); tl.Add(qb); tl.Add(qc); tl.Add(qb); tl.Add(qd); tl.Add(qc); }
+                else       { tl.Add(qa); tl.Add(qc); tl.Add(qb); tl.Add(qb); tl.Add(qc); tl.Add(qd); }
             }
 
-            // 1. side surface
+            // 1. side surface: u = along the roll (0..1), v = around it (0..1), one texture without tiling
             for (int i = 0; i <= rows; i++)
             {
                 float t = i / (float)rows, x = (t - 0.5f) * BundleLength;
@@ -497,13 +793,14 @@ namespace HangingHammock
                 {
                     float a = j / (float)seg * TwoPi;
                     verts.Add(At(x, OuterR(a, t), a, t));
+                    uvs.Add(new Vector2(t, j / (float)seg));
                 }
             }
             for (int i = 0; i < rows; i++)
                 for (int j = 0; j < seg; j++)
                 {
                     int s0 = i * stride + j;
-                    Quad(s0, s0 + 1, s0 + stride, s0 + stride + 1, false);
+                    Quad(sideTris, s0, s0 + 1, s0 + stride, s0 + stride + 1, false);
                 }
 
             // 2. seam wall (the step where the outer edge of the cloth ends); own vertices = hard edge
@@ -513,15 +810,17 @@ namespace HangingHammock
                 float t = i / (float)rows, x = (t - 0.5f) * BundleLength;
                 verts.Add(At(x, OuterR(TwoPi, t), TwoPi, t));   // lower side
                 verts.Add(At(x, OuterR(0f, t), 0f, t));         // upper side
+                uvs.Add(new Vector2(t, 0.998f));   // same v on both sides: the wall samples the shaded corner, no stretching
+                uvs.Add(new Vector2(t, 0.998f));
             }
             for (int i = 0; i < rows; i++)
             {
                 int I0 = wb + i * 2, O0 = I0 + 1, I1 = I0 + 2, O1 = I0 + 3;
-                tris.Add(I0); tris.Add(O0); tris.Add(I1);
-                tris.Add(O0); tris.Add(O1); tris.Add(I1);
+                sideTris.Add(I0); sideTris.Add(O0); sideTris.Add(I1);
+                sideTris.Add(O0); sideTris.Add(O1); sideTris.Add(I1);
             }
 
-            // 3. end faces with spiral
+            // 3. end faces with spiral: planar UV from (r, a), matches MakeCapTexture
             for (int end = 0; end < 2; end++)
             {
                 float sign = end == 0 ? -1f : 1f;
@@ -539,6 +838,8 @@ namespace HangingHammock
                         float r = rho * rim;
                         float off = CapOffset(r, a, rEnd, rim);
                         verts.Add(At(sign * (BundleLength * 0.5f - off), r, a, te));
+                        uvs.Add(new Vector2(0.5f + r * Mathf.Cos(a) / (2f * CapTexRadius),
+                                            0.5f + r * Mathf.Sin(a) / (2f * CapTexRadius)));
                     }
                 }
                 for (int m = 0; m < CapRings; m++)
@@ -546,13 +847,16 @@ namespace HangingHammock
                     {
                         int a0 = cb + m * stride + j;
                         int b0 = j < seg ? a0 + 1 : cb + m * stride;   // last column wraps to the first
-                        Quad(a0, b0, a0 + stride, b0 + stride, end == 1);
+                        Quad(capTris, a0, b0, a0 + stride, b0 + stride, end == 1);
                     }
             }
 
             var mesh = new Mesh { name = "hammock_bundle_cloth" };
             mesh.SetVertices(verts);
-            mesh.SetTriangles(tris, 0);
+            mesh.SetUVs(0, uvs);
+            mesh.subMeshCount = 2;
+            mesh.SetTriangles(sideTris, 0);
+            mesh.SetTriangles(capTris, 1);
             mesh.RecalculateNormals();
             mesh.RecalculateBounds();
             return mesh;
@@ -580,7 +884,8 @@ namespace HangingHammock
                         float av = v / (float)RopeTubeSeg * Mathf.PI * 2f;
                         var n = radial * Mathf.Cos(av) + Vector3.right * Mathf.Sin(av);
                         verts.Add(center + n * RopeRadius);
-                        uvs.Add(new Vector2(u / (float)RopeRingSeg * RopeUVTiling, v / (float)RopeTubeSeg));
+                        float uu = u / (float)RopeRingSeg * RopeUVTiling, vv = v / (float)RopeTubeSeg;
+                        uvs.Add(RopeUVSwap ? new Vector2(vv, uu) : new Vector2(uu, vv));
                     }
                 }
 
