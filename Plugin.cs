@@ -16,7 +16,9 @@ namespace HangingHammock
         public const float MaxCeiling = 3f, DefaultRope = 0.6f, MinRope = 0.1f, FloorClearance = 0.25f;
         public const float SleepOffset = -0.35f;
         public const float RopeThickness = 0.03f, KnotSize = 0.07f;
-        public const float Damping = 0.35f, MaxAngle = 35f, Inertia = 1f, AccelInfluence = 1f;
+        public const float Damping = 0.55f, MaxAngle = 28f, Inertia = 0.8f, AccelInfluence = 0.8f;
+        // With someone lying in it (player or NPC): multipliers on top of the values above
+        public const float OccupiedCalm = 0.6f, OccupiedDamping = 1.8f, OccupiedMaxAngle = 0.7f;
     }
 
     [BepInPlugin(GUID, NAME, VERSION)]

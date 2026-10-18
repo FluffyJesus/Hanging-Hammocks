@@ -51,6 +51,8 @@ namespace HangingHammock
         private Behaviour[] partOutlines;
         private FieldInfo outlineColor;
         private bool colliderInit, colliderHung;
+        private float npcLyingUntil, occupied;   // occupied: 0..1, eased; 1 = someone (player or NPC) is lying in the hammock
+        private void MarkNpcLying() { npcLyingUntil = Time.time + 2f; }
 
         public bool IsHung { get; private set; }
         private bool hangMode;
@@ -611,6 +613,15 @@ namespace HangingHammock
             if (dt <= 1e-6f) return;
             dt = Mathf.Min(dt, 0.5f);
 
+            // With a load (player in bed or a Virtual Crew NPC lying in it) the swing gets calmer; eased in over ~1 s
+            bool loaded = GameState.inBed == transform || Time.time < npcLyingUntil;
+            occupied = Mathf.MoveTowards(occupied, loaded ? 1f : 0f, dt);
+            float calm = Mathf.Lerp(1f, Tuning.OccupiedCalm, occupied);
+            float inertia = Tuning.Inertia * calm;
+            float accelInfluence = Tuning.AccelInfluence * calm;
+            float damping = Tuning.Damping * Mathf.Lerp(1f, Tuning.OccupiedDamping, occupied);
+            float maxAngle = Tuning.MaxAngle * Mathf.Lerp(1f, Tuning.OccupiedMaxAngle, occupied);
+
             if (hasPrev)
             {
                 Vector3 step = pivotW - prevPivot;
@@ -624,13 +635,13 @@ namespace HangingHammock
                 if (ang > 180f) ang -= 360f;
                 if (Mathf.Abs(ang) > 1e-4f && Mathf.Abs(ang) < 30f && !float.IsNaN(ax.x))
                 {
-                    phi -= ang * Vector3.Dot(ax, axisA) * Tuning.Inertia;
+                    phi -= ang * Vector3.Dot(ax, axisA) * inertia;
                 }
             }
             else prevPivotVel = Vector3.zero;
             prevPivot = pivotW; prevRestRot = restRot; hasPrev = true;
 
-            Vector3 gEff = Physics.gravity - pivotAcc * Tuning.AccelInfluence;
+            Vector3 gEff = Physics.gravity - pivotAcc * accelInfluence;
             Vector3 gl = Quaternion.Inverse(restRot) * gEff;
             Vector3 gA = Vector3.ProjectOnPlane(gl, axisA);
             float phiEq = Vector3.SignedAngle(Vector3.down, gA, axisA);
@@ -641,10 +652,10 @@ namespace HangingHammock
             float h = dt / n;
             for (int i = 0; i < n; i++)
             {
-                phiVel += (-w2A * Mathf.Sin((phi - phiEq) * Mathf.Deg2Rad) * Mathf.Rad2Deg - Tuning.Damping * phiVel) * h;
+                phiVel += (-w2A * Mathf.Sin((phi - phiEq) * Mathf.Deg2Rad) * Mathf.Rad2Deg - damping * phiVel) * h;
                 phi += phiVel * h;
             }
-            Clamp(ref phi, ref phiVel, Tuning.MaxAngle);
+            Clamp(ref phi, ref phiVel, maxAngle);
         }
 
         private static void Clamp(ref float a, ref float v, float max)
@@ -901,6 +912,7 @@ namespace HangingHammock
                         }
 
                         if (targetHammock == null) continue;
+                        targetHammock.MarkNpcLying();
 
                         Transform sleepT = targetHammock.swingParts[0];
                         Vector3 eyes = sleepT.position;
