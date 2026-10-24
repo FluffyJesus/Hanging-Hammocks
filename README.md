@@ -2,6 +2,8 @@
 
 A Sailwind mod that adds a buyable hammock you can hang from any ceiling — your cabin, the hold, under the deck. It swings with the waves, its height is adjustable, and you can sleep in it.
 
+<img width="2512" height="1390" alt="image" src="https://github.com/user-attachments/assets/c6412aba-a235-4773-9b73-1002e7fe4c5d" />
+
 ## Features
 
 - **New furniture item**: a hammock sold at furniture shops.
