@@ -10,7 +10,7 @@ A Sailwind mod that adds a buyable hammock you can hang from any ceiling — you
 - **Rolled up for transport**: in your hands and on the floor it is a compact bundle, easy to carry and store in the hold.
 - **Hang it under a ceiling**: unroll it under a ceiling and let go. Ropes stretch up at an angle, like a real taut hammock.
 - **Hang it from surfaces around you**: with no ceiling straight over it, each rope finds its own hook nearby (a beam, a wall, a tree, a wood pole) up to `MaxRope` away. The hammock turns to lie along the line between its hooks, and both ropes keep the same angle where the surfaces allow it.
-- **Hang it from wood poles**: with [Tent and Plank](https://github.com/DogEggz01/Tentandplank) installed, under a level pole or between two upright ones (see [Wood poles](#wood-poles-tent-and-plank)).
+- **Hang it from wood poles**: with [Tent and Plank](https://github.com/DogEggz01/Tentandplank) installed, under a level pole or between two upright ones.
 - **Safe ropes**: a rope is never flatter than 30° and never leans more than `RopeSideAngle` to the side, so the knot can't flip over the hammock. This is checked both when you hang it and when you change its height.
 - **Built-in iron hooks**: hooks turn toward the rope's pull, the loop sits on the bend.
 - **Adjustable height**: scroll the mouse wheel while looking at it.
