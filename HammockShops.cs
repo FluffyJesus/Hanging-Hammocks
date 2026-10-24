@@ -10,9 +10,9 @@ namespace HangingHammock
 
         // Места гамаков у мебельщиков: путь_родителя|локальная_позиция|локальный_поворот
         private const string Placements =
-            "island 1 A (gold rock) scenery|1553.865,6.174,-363.536|0,52.706,0;" +
-            "island 15 M (Fort) scenery|-8.534,2.587,56.261|0,205.018,0;" +
-            "island 9 E (dragon cliffs) scenery|-87.994,4.17,-540.262|0,135.937,0";
+            "island 1 A (gold rock) scenery|1552.394,5.344,-358.278|0,148.93,0;" +
+            "island 15 M (Fort) scenery|-9.417,2.152,57.834|0,117.075,0;" +
+            "island 9 E (dragon cliffs) scenery|-87.657,3.735,-540.059|0,135.363,0";
 
         private struct Spot { public Vector3 pos, euler; }
 

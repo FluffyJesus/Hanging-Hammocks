@@ -805,6 +805,14 @@ namespace HangingHammock
                     Type locatorType = vcAsm.GetType("SailwindVirtualCrew.LocatorUtils");
                     if (locatorType != null)
                     {
+                        // A rolled or lying hammock is not a bed: crew only sleep in a hung one
+                        MethodInfo findBedsMethod = locatorType.GetMethod("FindBedsOnBoat", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (findBedsMethod != null)
+                        {
+                            var findPostfix = typeof(VirtualCrewPatch).GetMethod(nameof(FindBedsOnBoatPostfix), BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                            harmony.Patch(findBedsMethod, postfix: new HarmonyMethod(findPostfix));
+                        }
+
                         MethodInfo bedCheckMethod = locatorType.GetMethod("IsBedStillOnBoat", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
                         if (bedCheckMethod != null)
                         {
@@ -836,12 +844,24 @@ namespace HangingHammock
             {
                 if (bed == null) return true;
                 HammockHanger hanger = bed.GetComponent<HammockHanger>() ?? bed.GetComponentInParent<HammockHanger>();
-                if (hanger != null && hanger.IsHung)
+                if (hanger != null)
                 {
-                    __result = true;
+                    // hung: stays a bed while the boat moves; taken down or rolled up: the sleeper gets up
+                    __result = hanger.IsHung;
                     return false;
                 }
                 return true;
+            }
+
+            public static void FindBedsOnBoatPostfix(List<Component> __result)
+            {
+                if (__result == null) return;
+                __result.RemoveAll(bed =>
+                {
+                    if (bed == null) return false;
+                    HammockHanger hanger = bed.GetComponent<HammockHanger>() ?? bed.GetComponentInParent<HammockHanger>();
+                    return hanger != null && !hanger.IsHung;
+                });
             }
 
             public static void TickPrefix(object __instance)
