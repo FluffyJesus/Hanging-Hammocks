@@ -89,7 +89,10 @@ namespace HangingHammock
             {
                 Vector3 n = topNormal.sqrMagnitude > 1e-6f ? topNormal.normalized : Vector3.down;
                 Vector3 hy = -n;
-                hz = Vector3.ProjectOnPlane(hookAxis, n);
+                // The hook turns so the rope lies in its plane and curls away from the pull (on a wall: its open end up)
+                Vector3 curl = Vector3.ProjectOnPlane(top - bottom, n);
+                if (curl.sqrMagnitude > 1e-6f) hz = Vector3.Cross(n, curl.normalized);
+                else hz = Mathf.Abs(n.y) < 0.5f ? Vector3.Cross(n, Vector3.up) : Vector3.ProjectOnPlane(hookAxis, n);
                 if (hz.sqrMagnitude < 1e-6f) hz = Vector3.ProjectOnPlane(Vector3.forward, n);
                 if (hz.sqrMagnitude < 1e-6f) hz = Vector3.ProjectOnPlane(Vector3.right, n);
                 hz.Normalize();
@@ -97,7 +100,10 @@ namespace HangingHammock
                 hx = hq * Vector3.right;
 
                 hookGo.transform.SetPositionAndRotation(top, hq);
-                end = top + n * HookModel.Depth + hx * HookModel.Reach;
+                // The loop rests on the bend where the rope pulls it: from the bend's centre toward the hammock end
+                Vector3 bend = top + n * HookModel.Neck + hx * HookModel.Reach;
+                Vector3 pull = Vector3.ProjectOnPlane(bottom - bend, hz);
+                end = bend + (pull.sqrMagnitude > 1e-6f ? pull.normalized : n) * HookModel.Reach;
                 slack = Mathf.Max(0f, 0.33f * ks - HookModel.WireRadius);
             }
 

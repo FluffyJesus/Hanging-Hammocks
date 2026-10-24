@@ -22,6 +22,13 @@ namespace HangingHammock
 
         internal const int Mask = ~((1 << 2) | (1 << 5));
         private const string KeyPrefix = "HangingHammock.";
+        private const string PoleTag = ";pole", PostsTag = ";posts", FreeTag = ";free;";
+        // Between two upright poles: the posts stand at least the hammock's length plus PostGap apart (room for the ropes),
+        // at most plus PostMaxGap. A rope rises PostRopeSlope degrees from the end to its hook, carrying on the cloth's line
+        private const float PostGap = 0.1f, PostMaxGap = 1.5f, PostRopeSlope = 35f;
+        // A rope never runs flatter than this over level, at hanging or at a height change (else its knot turns over)
+        private const float MinRopeAngle = 30f;
+        private static float HookRise(float gap) => Mathf.Max(0.03f, gap) * Mathf.Tan(PostRopeSlope * Mathf.Deg2Rad);
         private const float AnchorSearch = 2.5f, AnchorMinDist = 0.12f;
         private static readonly CultureInfo CI = CultureInfo.InvariantCulture;
         private static readonly FieldInfo OnBoatF =
@@ -70,6 +77,23 @@ namespace HangingHammock
         private Quaternion prevRestRot;
 
         private RopeVisual[] ropes;
+
+        // Hung from Tent and Plank wood poles (PoleSupport): a level one over it (onPole) or two upright posts (onPosts:
+        // pole and post2). It comes down when a pole is picked up or removed
+        private ShipItem pole, post2;
+        private bool onPole, onPosts;
+        private float poleWaitUntil;   // after a load: how long to look for the poles before taking the hammock down
+        private PoleSupport.Hit previewBeam;
+        private ShipItem previewPostA, previewPostB;
+        private bool lastTooFlat;
+
+        // Hung from surfaces around it (no ceiling straight over it): each rope found its own hook, saved with the hammock
+        private bool onFree, previewFree;
+        private readonly Vector3[] previewFreeA = new Vector3[2], previewFreeN = new Vector3[2];
+        private readonly ShipItem[] previewFreePoles = new ShipItem[2];
+        // A hook of those on a wood pole: the pole (found again after a load); it comes down when the pole goes
+        private readonly ShipItem[] freePoles = new ShipItem[2];
+        private readonly bool[] freeOnPole = new bool[2];
 
         private readonly Vector3[] topL = new Vector3[2];
         private readonly Vector3[] topN = new Vector3[2];
@@ -213,8 +237,24 @@ namespace HangingHammock
                 }
                 item.holdDistance = hangMode ? Tuning.HangHold : Tuning.BundleHold;
 
-                canHang = hangMode && ProbeForHang(ToPhys(transform.position), out probeUp, out _, out _);
-                if (canHang && !lastCanHang) Notify("Release to hang the hammock");
+                canHang = hangMode && ProbeForHang(ToPhys(transform.position), out probeUp, out _, out _, out previewBeam);
+                previewPostA = previewPostB = null;
+                previewFree = false;
+                if (hangMode && !canHang) canHang = ProbePosts(ToPhys(transform.position), out previewPostA, out previewPostB, out _, out _);
+                bool tooFlat = canHang && PreviewMatrix(out var pm) && !RopesSteep(pm, probeUp, previewBeam.pole, previewPostA, previewPostB);
+                if (tooFlat) canHang = false;
+                if (hangMode && !canHang && PreviewMatrix(out var fm) && ProbeFree(fm, previewFreeA, previewFreeN, previewFreePoles, out _, out _))
+                {
+                    canHang = previewFree = true;
+                    tooFlat = false;
+                    previewBeam = default;
+                    previewPostA = previewPostB = null;
+                }
+                if (tooFlat && !lastTooFlat) Notify("The ropes would be too flat here");
+                lastTooFlat = tooFlat;
+                if (canHang && !lastCanHang)
+                    Notify(previewPostA != null ? "Release to hang the hammock between the posts"
+                        : previewBeam.pole != null ? "Release to hang the hammock from the pole" : "Release to hang the hammock");
                 lastCanHang = canHang;
             }
             else
@@ -234,6 +274,8 @@ namespace HangingHammock
         private void UpdateHung()
         {
             if (!item.nailed) { Unhang(); Notify("Hammock taken down"); return; }
+            if ((onPole || onPosts) && !PoleHolds()) return;
+            if (onFree && !FreePolesHold()) return;
             if (!twinC.attached) twinC.attached = true;
             if (twinC.inStove) twinC.inStove = false;
             if (HandleTakeDown()) return;
@@ -281,17 +323,74 @@ namespace HangingHammock
             return found;
         }
 
-        private bool ProbeForHang(Vector3 origin, out float up, out float room, out float len)
+        private bool ProbeForHang(Vector3 origin, out float up, out float room, out float len, out PoleSupport.Hit beam)
         {
             up = room = len = 0f;
-            if (!CastStatic(origin, Vector3.up, Tuning.MaxCeiling, out var ch)) return false;
-            if (Mathf.Abs(ch.normal.y) < 0.5f) return false;
-            up = ch.distance;
-            room = CastStatic(ch.point + Vector3.down * 0.05f, Vector3.down, 8f, out var fh) ? fh.distance + 0.05f : 8f;
+            bool hitCeil = CastStatic(origin, Vector3.up, Tuning.MaxCeiling, out var ch);
+            // A wood pole under the ceiling (or with no ceiling over it) is the beam; one above the ceiling is out of reach
+            if (PoleSupport.Find(origin, hitCeil ? ch.distance : Tuning.MaxCeiling, out beam))
+                up = beam.under.y - origin.y;
+            else
+            {
+                if (!hitCeil || Mathf.Abs(ch.normal.y) < 0.5f) return false;
+                up = ch.distance;
+            }
+            Vector3 top = origin + Vector3.up * up;
+            room = CastStatic(top + Vector3.down * 0.05f, Vector3.down, 8f, out var fh) ? fh.distance + 0.05f : 8f;
             float maxLen = room - Height - Tuning.FloorClearance;
             if (maxLen < Tuning.MinRope) return false;
             len = Mathf.Clamp(Tuning.DefaultRope, Tuning.MinRope, maxLen);
             return true;
+        }
+
+        // Two upright poles on both sides of origin. The hooks go where the hammock is held (its ends rise under them),
+        // kept within the height both posts reach and raised so its bottom clears the floor
+        private bool ProbePosts(Vector3 origin, out ShipItem postA, out ShipItem postB, out float hookY, out float rise)
+        {
+            float endY = EndLocal(1f).y;
+            float span = Vector3.Distance(EndLocal(-1f), EndLocal(1f));
+            hookY = rise = 0f;
+            if (!PoleSupport.FindPosts(origin, span + PostGap, span + PostMaxGap, out postA, out postB)) return false;
+            if (!PoleSupport.PostRange(postA, out float loA, out float hiA) || !PoleSupport.PostRange(postB, out float loB, out float hiB)) return false;
+            float lo = Mathf.Max(loA, loB), hi = Mathf.Min(hiA, hiB);
+            if (hi <= lo) return false;
+
+            PoleSupport.PostPoint(postA, (lo + hi) * 0.5f, out var pa, out float ra);
+            PoleSupport.PostPoint(postB, (lo + hi) * 0.5f, out var pb, out float rb);
+            Vector3 between = pb - pa; between.y = 0f;
+            rise = HookRise((between.magnitude - span - ra - rb) * 0.5f);
+            hookY = Mathf.Clamp(origin.y + endY + rise, lo, hi);
+
+            Vector3 mid = (pa + pb) * 0.5f; mid.y = hookY;
+            if (CastStatic(mid, Vector3.down, 8f, out var fh))
+            {
+                float bottom = hookY - rise - endY + bCenter.y - bExt.y;
+                float lift = fh.point.y + Tuning.FloorClearance - bottom;
+                if (lift > 0f) hookY += lift;
+            }
+            return PoleSupport.PostPoint(postA, hookY, out _, out _) && PoleSupport.PostPoint(postB, hookY, out _, out _);
+        }
+
+        // Where the rope from this end (physics space) ties to the post: PostRopeSlope over the end, on the side facing it
+        private static Vector3 PostHook(ShipItem post, Vector3 endW, out Vector3 normal)
+        {
+            float rise = HookRise(0.1f);
+            if (PoleSupport.PostPoint(post, endW.y, out var axis, out float r))
+            {
+                Vector3 gap = axis - endW; gap.y = 0f;
+                rise = HookRise(gap.magnitude - r);
+            }
+            return PoleSupport.PostAnchor(post, endW.y + rise, endW, out normal);
+        }
+
+        // The post a rope from this end (physics space) ties to: the nearer of the two
+        private ShipItem PostFor(Vector3 endW, ShipItem a, ShipItem b)
+        {
+            if (a == null || b == null) return a ?? b;
+            bool aOk = PoleSupport.PostPoint(a, endW.y, out var pa, out _), bOk = PoleSupport.PostPoint(b, endW.y, out var pb, out _);
+            if (!aOk || !bOk) return aOk ? a : b;
+            pa.y = pb.y = endW.y;
+            return (pa - endW).sqrMagnitude <= (pb - endW).sqrMagnitude ? a : b;
         }
 
         private static Vector3 FindAnchor(Matrix4x4 m, Vector3 endL, Vector3 nominalL, out Vector3 normal)
@@ -318,16 +417,211 @@ namespace HangingHammock
             return b;
         }
 
+        // Where the rope of end i (0: -axis, 1: +axis) ties, for the hammock at m: between posts, on a beam pole or at the
+        // ceiling ceilY over it (in its own frame)
+        private Vector3 AnchorW(Matrix4x4 m, int i, float ceilY, ShipItem beamPole, ShipItem postA, ShipItem postB, out Vector3 nW)
+        {
+            float sign = i == 0 ? -1f : 1f;
+            Vector3 e = EndLocal(sign);
+            if (postA != null && postB != null)
+            {
+                Vector3 endW = m.MultiplyPoint3x4(e);
+                return PostHook(PostFor(endW, postA, postB), endW, out nW);
+            }
+            ceilY = Mathf.Max(e.y + 0.05f, ceilY);
+            if (beamPole != null) return PoleSupport.Anchor(beamPole, m.MultiplyPoint3x4(TopAnchor(e, sign, ceilY)), out nW);
+            return FindAnchor(m, e, TopAnchor(e, sign, ceilY), out nW);
+        }
+
+        // A rope from a hammock end (side: level, across the hammock) at least MinRopeAngle over level and leaning at most
+        // RopeSideAngle out of the upright plane through the hammock's length
+        private static bool RopeFits(Vector3 rope, Vector3 side)
+        {
+            float l = rope.magnitude;
+            if (l < 1e-3f) return true;
+            float maxSide = Mathf.Sin(Mathf.Clamp(Plugin.RopeSideAngle.Value, 0f, 90f) * Mathf.Deg2Rad);
+            return rope.y / l >= Mathf.Sin(MinRopeAngle * Mathf.Deg2Rad) && Mathf.Abs(Vector3.Dot(rope, side)) / l <= maxSide + 1e-4f;
+        }
+
+        // Both ropes fit (RopeFits) for the hammock at m
+        private bool RopesSteep(Matrix4x4 m, float ceilY, ShipItem beamPole, ShipItem postA, ShipItem postB)
+        {
+            Vector3 side = Vector3.ProjectOnPlane(m.MultiplyVector(axisT), Vector3.up).normalized;
+            for (int i = 0; i < 2; i++)
+            {
+                Vector3 end = m.MultiplyPoint3x4(EndLocal(i == 0 ? -1f : 1f));
+                if (!RopeFits(AnchorW(m, i, ceilY, beamPole, postA, postB, out _) - end, side)) return false;
+            }
+            return true;
+        }
+
+        // Hooks for a hammock held at m on any surface around it but the tops of things (ceilings, beams, walls, trees): from
+        // each end the rope nearest the usual RopeAngle, at least MinRopeAngle over level, at most MaxRope long, in any direction.
+        // Hung, the hammock turns to lie along the line between the hooks, centred between them at the height it is held;
+        // there its ropes must fit (RopeFits, MinRope..MaxRope) and its bottom clear the floor
+        private bool ProbeFree(Matrix4x4 m, Vector3[] aW, Vector3[] nW, ShipItem[] onPoles, out Vector3 pos, out Quaternion rot)
+        {
+            Vector3 up = Vector3.up;
+            pos = m.MultiplyPoint3x4(Vector3.zero);
+            rot = m.rotation;
+
+            float maxRope = Mathf.Max(Tuning.MinRope + 0.1f, Plugin.MaxRope.Value);
+            float nominal = 90f - Mathf.Clamp(Plugin.RopeAngle.Value, 0f, 90f - MinRopeAngle);
+            float[] elevations = { nominal, 90f, 75f, 60f, 45f, MinRopeAngle + 1f };
+            float[] azimuths = { 0f, 15f, -15f, 30f, -30f, 45f, -45f, 60f, -60f, 75f, -75f, 90f, -90f };
+            for (int i = 0; i < 2; i++)
+            {
+                float sign = i == 0 ? -1f : 1f;
+                Vector3 end = m.MultiplyPoint3x4(EndLocal(sign));
+                Vector3 outward = Vector3.ProjectOnPlane(m.MultiplyVector(axisA * sign), up).normalized;
+                Vector3 side = Vector3.Cross(up, outward);
+                float bestScore = float.MaxValue;
+                bool found = false;
+                foreach (float el in elevations)
+                    foreach (float az in azimuths)
+                    {
+                        if (el >= 89.9f && az != 0f) continue;
+                        float e = el * Mathf.Deg2Rad, a = az * Mathf.Deg2Rad;
+                        Vector3 dir = Mathf.Cos(e) * (Mathf.Cos(a) * outward + Mathf.Sin(a) * side) + Mathf.Sin(e) * up;
+                        float score = Mathf.Abs(el - nominal) + Mathf.Abs(az);
+                        if (score >= bestScore) continue;
+                        if (!CastHook(end, dir, maxRope, out var hp, out var hn, out var hpole)) continue;
+                        bestScore = score; aW[i] = hp; nW[i] = hn; onPoles[i] = hpole; found = true;
+                    }
+                if (!found) return false;
+            }
+
+            // Along the hooks' line: the long axis from hook 0 to hook 1, the ends centred between them
+            Vector3 line = aW[1] - aW[0]; line.y = 0f;
+            if (line.sqrMagnitude > 1e-4f)
+            {
+                line.Normalize();
+                rot = Quaternion.LookRotation(axisA == Vector3.forward ? line : Vector3.Cross(line, up), up);
+                Vector3 endsMid = (EndLocal(-1f) + EndLocal(1f)) * 0.5f; endsMid.y = 0f;
+                Vector3 mid = (aW[0] + aW[1]) * 0.5f;
+                mid.y = pos.y;
+                pos = mid - rot * endsMid;
+            }
+
+            var hung = Matrix4x4.TRS(pos, rot, Vector3.one);
+            Vector3 across = rot * axisT;
+
+            // Both ropes at one angle: from the usual RopeAngle outward, the first elevation at which a straight rope from
+            // each end, out along the hammock, meets a surface for both (else the hooks found above stay)
+            Vector3 alongW = rot * axisA;
+            var symA = new Vector3[2]; var symN = new Vector3[2]; var symP = new ShipItem[2];
+            for (int k = 0; k <= 48; k++)
+            {
+                float el = nominal + (k % 2 == 0 ? 1f : -1f) * 1.25f * ((k + 1) / 2);
+                if (el < MinRopeAngle + 0.5f || el > 90f) continue;
+                float e = el * Mathf.Deg2Rad;
+                bool both = true;
+                for (int i = 0; i < 2 && both; i++)
+                {
+                    Vector3 end = hung.MultiplyPoint3x4(EndLocal(i == 0 ? -1f : 1f));
+                    Vector3 dir = Mathf.Cos(e) * alongW * (i == 0 ? -1f : 1f) + Mathf.Sin(e) * up;
+                    both = CastHook(end, dir, maxRope, out symA[i], out symN[i], out symP[i]);
+                }
+                if (!both) continue;
+                for (int i = 0; i < 2; i++) { aW[i] = symA[i]; nW[i] = symN[i]; onPoles[i] = symP[i]; }
+                break;
+            }
+            for (int i = 0; i < 2; i++)
+            {
+                Vector3 rope = aW[i] - hung.MultiplyPoint3x4(EndLocal(i == 0 ? -1f : 1f));
+                float l = rope.magnitude;
+                if (l < Tuning.MinRope || l > maxRope || !RopeFits(rope, across)) return false;
+            }
+            Vector3 center = hung.MultiplyPoint3x4(bCenter);
+            return !CastStatic(center, Vector3.down, 8f, out var fh) || center.y - bExt.y - fh.point.y >= Tuning.FloorClearance;
+        }
+
+        // Where a rope from o along dir first meets a hook's place within max: a surface but the top of something, or a
+        // fixed wood pole (pole: which one)
+        private static bool CastHook(Vector3 o, Vector3 dir, float max, out Vector3 point, out Vector3 normal, out ShipItem pole)
+        {
+            point = normal = default; pole = null;
+            float best = float.MaxValue;
+            if (CastStatic(o, dir, max, out var h, Tuning.MinRope))
+            {
+                Vector3 n = Vector3.Dot(h.normal, dir) > 0f ? -h.normal : h.normal;
+                if (n.y <= 0.5f) { best = h.distance; point = h.point; normal = n; }
+            }
+            if (PoleSupport.Raycast(o, dir, max, Tuning.MinRope, out float d, out var pp, out var pn, out var hitPole) && d < best)
+            {
+                best = d; point = pp; normal = pn; pole = hitPole;
+            }
+            return best < float.MaxValue;
+        }
+
+        // Hung from surfaces: a hook on a wood pole holds while the pole is fixed; after a load the pole is looked for again
+        // at the hook. A pole picked up, removed or never found takes the hammock down
+        private bool FreePolesHold()
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                if (!freeOnPole[i]) continue;
+                if (freePoles[i] == null && Time.time < poleWaitUntil)
+                {
+                    freePoles[i] = PoleSupport.PoleAt(twin.TransformPoint(topL[i]), 0.05f);
+                    continue;
+                }
+                if (PoleSupport.Usable(freePoles[i])) continue;
+                colGraceUntil = Time.unscaledTime + 1f;
+                item.nailed = false;
+                Unhang();
+                Notify("The pole is gone: hammock taken down");
+                return false;
+            }
+            return true;
+        }
+
+        // Hung from surfaces: the hammock moves d down (d < 0: up) under fixed hooks. Each rope keeps MinRope..MaxRope and
+        // MinRopeAngle, and the floor stays clear
+        private void SetFreeHeight(float d)
+        {
+            float maxRope = Mathf.Max(Tuning.MinRope + 0.1f, Plugin.MaxRope.Value);
+            var newTop = new Vector3[2];
+            float longest = 0f;
+            for (int i = 0; i < 2; i++)
+            {
+                newTop[i] = topL[i] + Vector3.up * d;
+                Vector3 rope = newTop[i] - EndLocal(i == 0 ? -1f : 1f);
+                float l = rope.magnitude;
+                if (l < Tuning.MinRope || l > maxRope) { Notify("Limit reached"); return; }
+                if (d < 0f && !RopeFits(rope, axisT)) { Notify("Limit reached: the ropes would be too flat"); return; }
+                longest = Mathf.Max(longest, l);
+            }
+            if (d > 0f)
+            {
+                Vector3 center = twin.TransformPoint(bCenter);
+                if (CastStatic(center, Vector3.down, 8f, out var fh) && center.y - bExt.y - d - fh.point.y < Tuning.FloorClearance)
+                { Notify("Limit reached"); return; }
+            }
+
+            twin.position -= twin.up * d;
+            if (body != null) body.position = twin.position;
+            transform.position -= transform.up * d;
+            if (pinTimer > 0f) Pin(pinTimer);
+
+            topL[0] = newTop[0]; topL[1] = newTop[1];
+            ropeLength += d;
+            hasPrev = false;
+            Save();
+            UISoundPlayer.instance.PlayUISound(UISounds.winchClick, 0.6f, 1f);
+            Notify("Rope: " + longest.ToString("0.00", CI) + " m");
+        }
+
         private void ComputeHungAnchors()
         {
             if (twin == null) return;
+            if (onFree) { anchorsDirty = false; return; }   // its hooks are fixed where it was hung (topL, saved)
             Matrix4x4 m = twin.localToWorldMatrix;
             float ceilY = Top + ropeLength;
             for (int i = 0; i < 2; i++)
             {
-                float sign = i == 0 ? -1f : 1f;
-                Vector3 e = EndLocal(sign);
-                topL[i] = twin.InverseTransformPoint(FindAnchor(m, e, TopAnchor(e, sign, ceilY), out Vector3 nW));
+                Vector3 aW = AnchorW(m, i, ceilY, onPole ? pole : null, onPosts ? pole : null, onPosts ? post2 : null, out Vector3 nW);
+                topL[i] = twin.InverseTransformPoint(aW);
                 topN[i] = twin.InverseTransformDirection(nW);
             }
             anchorsDirty = false;
@@ -341,19 +635,72 @@ namespace HangingHammock
 
         private void Hang()
         {
-            if (!ProbeForHang(twin.position, out float up, out _, out float len)) return;
-
-            Vector3 ceil = twin.position + Vector3.up * up;
             Vector3 fwd = Vector3.ProjectOnPlane(twin.forward, Vector3.up);
             if (fwd.sqrMagnitude < 1e-4f) fwd = Vector3.ProjectOnPlane(twin.up, Vector3.up);
+            Vector3 heldFwd = fwd.normalized;
+            Vector3 pos = twin.position;
+            ShipItem postA = null, postB = null;
+            bool placed = true;
+
+            if (ProbeForHang(twin.position, out float up, out _, out float len, out var beam))
+            {
+                Vector3 ceil = twin.position + Vector3.up * up;
+                if (beam.pole != null)
+                {
+                    // On a pole: straight under it, the long side along it, so both ropes reach it
+                    ceil = beam.under;
+                    fwd = PoleSupport.AlongForward(beam.dir, axisA, fwd.normalized);
+                }
+                pos = ceil - Vector3.up * (Top + len);
+            }
+            else if (ProbePosts(twin.position, out postA, out postB, out float hookY, out float rise))
+            {
+                // Between posts: its ends centred between them, the long side from post to post, the ends under the hooks
+                PoleSupport.PostPoint(postA, hookY, out var pa, out _);
+                PoleSupport.PostPoint(postB, hookY, out var pb, out _);
+                Vector3 span = pb - pa; span.y = 0f;
+                fwd = PoleSupport.AlongForward(span.normalized, axisA, fwd.normalized);
+                Vector3 endsMid = (EndLocal(-1f) + EndLocal(1f)) * 0.5f; endsMid.y = 0f;
+                pos = (pa + pb) * 0.5f - Quaternion.LookRotation(fwd.normalized, Vector3.up) * endsMid;
+                pos.y = hookY - rise - EndLocal(1f).y;
+                len = rise;
+            }
+            else placed = false;
+
             Quaternion rot = Quaternion.LookRotation(fwd.normalized, Vector3.up);
+            var freeW = new Vector3[2]; var freeN = new Vector3[2]; var freeP = new ShipItem[2];
+            bool free = false;
+            if (!placed || !RopesSteep(Matrix4x4.TRS(pos, rot, Vector3.one), Top + len, beam.pole, postA, postB))
+            {
+                // Nothing straight over it, or the ropes would be too flat: hooks on the surfaces around it, where it is held
+                if (!ProbeFree(Matrix4x4.TRS(twin.position, Quaternion.LookRotation(heldFwd, Vector3.up), Vector3.one), freeW, freeN, freeP, out pos, out rot))
+                {
+                    if (placed) Notify("The ropes would be too flat here");
+                    return;
+                }
+                free = true;
+                beam = default; postA = postB = null;
+                len = 0f;
+                for (int i = 0; i < 2; i++)
+                    len = Mathf.Max(len, Vector3.Distance(freeW[i], Matrix4x4.TRS(pos, rot, Vector3.one).MultiplyPoint3x4(EndLocal(i == 0 ? -1f : 1f))));
+            }
+            onFree = free;
+            onPole = beam.pole != null;
+            onPosts = postA != null;
+            pole = onPosts ? postA : beam.pole;
+            post2 = postB;
 
             ropeLength = len;
-            Vector3 pos = ceil - Vector3.up * (Top + ropeLength);
 
             if (body != null && !body.isKinematic) { body.velocity = Vector3.zero; body.angularVelocity = Vector3.zero; }
             twin.SetPositionAndRotation(pos, rot);
             if (body != null) { body.position = pos; body.rotation = rot; }
+            if (free)
+                for (int i = 0; i < 2; i++)
+                {
+                    topL[i] = twin.InverseTransformPoint(freeW[i]); topN[i] = twin.InverseTransformDirection(freeN[i]);
+                    freePoles[i] = freeP[i]; freeOnPole[i] = freeP[i] != null;
+                }
             item.nailed = true;
             SetHungPhysics(true);
             Pin(0.5f);
@@ -371,6 +718,10 @@ namespace HangingHammock
         private void Unhang()
         {
             IsHung = false;
+            pole = post2 = null;
+            onPole = onPosts = onFree = false;
+            freePoles[0] = freePoles[1] = null;
+            freeOnPole[0] = freeOnPole[1] = false;
             pinTimer = 0f;
             takeDownHold = 0f;
             takeDownHintShown = false;
@@ -453,14 +804,24 @@ namespace HangingHammock
 
         private void SetRopeLength(float target)
         {
+            if (onPosts) { SetPostHeight(target - ropeLength); return; }
+            if (onFree) { SetFreeHeight(target - ropeLength); return; }
             float maxLen = 5f;
-            if (CastStatic(twin.position, twin.up, Top + ropeLength + 0.5f, out var ch) &&
+            if (pole != null)
+            {
+                if (PoleSupport.Under(pole, twin.position, out Vector3 under) &&
+                    CastStatic(under - twin.up * 0.05f, -twin.up, 8f, out var ph))
+                    maxLen = ph.distance + 0.05f - Height - Tuning.FloorClearance;
+            }
+            else if (CastStatic(twin.position, twin.up, Top + ropeLength + 0.5f, out var ch) &&
                 CastStatic(ch.point - twin.up * 0.05f, -twin.up, 8f, out var fh))
                 maxLen = fh.distance + 0.05f - Height - Tuning.FloorClearance;
 
             float newLen = Mathf.Clamp(target, Tuning.MinRope, Mathf.Max(Tuning.MinRope, maxLen));
             float d = newLen - ropeLength;
             if (Mathf.Abs(d) < 1e-4f) { Notify("Limit reached"); return; }
+            if (d < 0f && !RopesSteep(Matrix4x4.Translate(-twin.up * d) * twin.localToWorldMatrix, Top + newLen, onPole ? pole : null, null, null))
+            { Notify("Limit reached: the ropes would be too flat"); return; }
 
             twin.position -= twin.up * d;
             if (body != null) body.position = twin.position;
@@ -473,6 +834,32 @@ namespace HangingHammock
             Save();
             UISoundPlayer.instance.PlayUISound(UISounds.winchClick, 0.6f, 1f);
             Notify("Rope: " + ropeLength.ToString("0.00", CI) + " m");
+        }
+
+        // Between posts the hooks slide along them: d > 0 lowers the hammock. Both posts must reach, the floor stays clear
+        private void SetPostHeight(float d)
+        {
+            bool reach = true;
+            for (int i = 0; i < 2; i++)
+            {
+                Vector3 endW = twin.TransformPoint(EndLocal(i == 0 ? -1f : 1f));
+                var post = PostFor(endW, pole, post2);
+                reach &= PoleSupport.PostPoint(post, PostHook(post, endW, out _).y - d, out _, out _);
+            }
+            float bottom = twin.position.y + bCenter.y - bExt.y - d;
+            bool clear = !CastStatic(twin.position + Vector3.up * Top, Vector3.down, 8f, out var fh) || bottom - fh.point.y >= Tuning.FloorClearance;
+            if (!reach || !clear) { Notify("Limit reached"); return; }
+            if (d < 0f && !RopesSteep(Matrix4x4.Translate(-twin.up * d) * twin.localToWorldMatrix, 0f, null, pole, post2))
+            { Notify("Limit reached: the ropes would be too flat"); return; }
+
+            twin.position -= twin.up * d;
+            if (body != null) body.position = twin.position;
+            transform.position -= transform.up * d;
+            if (pinTimer > 0f) Pin(pinTimer);
+
+            hasPrev = false;
+            MarkAnchorsDirty(0.3f);
+            UISoundPlayer.instance.PlayUISound(UISounds.winchClick, 0.6f, 1f);
         }
 
         private Vector3 RestPos(int i) =>
@@ -516,7 +903,7 @@ namespace HangingHammock
 
             bool freeze = !Plugin.EnableSwing.Value || (Plugin.FreezeSwingInBed.Value && GameState.inBed == transform);
             if (freeze) { phi = phiVel = 0f; hasPrev = false; }
-            else Simulate(Time.deltaTime, transform.rotation, pivotW, ropeLength + bExt.y);
+            else Simulate(Time.deltaTime, transform.rotation, pivotW, onPosts || onFree ? Vector3.Distance(pivotL, bCenter) : ropeLength + bExt.y);
 
             Quaternion S = Quaternion.AngleAxis(phi, swingAxisL);
             for (int i = 0; i < swingParts.Length; i++)
@@ -680,22 +1067,29 @@ namespace HangingHammock
             return new Vector3(e.x, ceilY, e.z) + axisA * (sign * spread);
         }
 
-        private void DrawPreview()
+        // The held hammock, level, in physics space
+        private bool PreviewMatrix(out Matrix4x4 m)
         {
+            m = Matrix4x4.identity;
             Vector3 origin = ToPhys(transform.position);
             Quaternion physRot = ToPhys(transform.rotation);
             Vector3 fwd = Vector3.ProjectOnPlane(physRot * Vector3.forward, Vector3.up);
             if (fwd.sqrMagnitude < 1e-4f) fwd = Vector3.ProjectOnPlane(physRot * Vector3.up, Vector3.up);
-            if (fwd.sqrMagnitude < 1e-4f) { SetRopesVisible(false); return; }
-            Matrix4x4 m = Matrix4x4.TRS(origin, Quaternion.LookRotation(fwd.normalized, Vector3.up), Vector3.one);
+            if (fwd.sqrMagnitude < 1e-4f) return false;
+            m = Matrix4x4.TRS(origin, Quaternion.LookRotation(fwd.normalized, Vector3.up), Vector3.one);
+            return true;
+        }
+
+        private void DrawPreview()
+        {
+            if (!PreviewMatrix(out var m)) { SetRopesVisible(false); return; }
 
             Vector3 sideW = transform.TransformDirection(axisA);
             for (int i = 0; i < 2; i++)
             {
-                float sign = i == 0 ? -1f : 1f;
-                Vector3 e = EndLocal(sign);
-                float ceilY = Mathf.Max(e.y + 0.05f, probeUp);
-                Vector3 pPhys = FindAnchor(m, e, TopAnchor(e, sign, ceilY), out Vector3 nPhys);
+                Vector3 e = EndLocal(i == 0 ? -1f : 1f);
+                Vector3 nPhys = previewFree ? previewFreeN[i] : default;
+                Vector3 pPhys = previewFree ? previewFreeA[i] : AnchorW(m, i, probeUp, previewBeam.pole, previewPostA, previewPostB, out nPhys);
                 Vector3 top = ToItem(pPhys);
                 Vector3 nItem = (ToItem(pPhys + nPhys) - top).normalized;
                 ropes[i].Set(top, nItem, transform.TransformPoint(e), sideW, sideW);
@@ -726,7 +1120,7 @@ namespace HangingHammock
         private void Save()
         {
             string k = Key();
-            if (k != null && GameState.modData != null) GameState.modData[k] = ropeLength.ToString("R", CI);
+            if (k != null && GameState.modData != null) GameState.modData[k] = ropeLength.ToString("R", CI) + (onPole ? PoleTag : onPosts ? PostsTag : onFree ? FreeTag + FreeHooks() : "");
         }
 
         private void RemoveSave()
@@ -743,6 +1137,17 @@ namespace HangingHammock
             restoreDone = true;
             if (!GameState.modData.TryGetValue(k, out string s)) return;
             if (!item.nailed) { GameState.modData.Remove(k); return; }
+            int free = s.IndexOf(FreeTag, StringComparison.Ordinal);
+            onFree = free >= 0 && ReadFreeHooks(s.Substring(free + FreeTag.Length));
+            if (free >= 0) s = s.Substring(0, free);
+            onPole = s.EndsWith(PoleTag, StringComparison.Ordinal);
+            onPosts = s.EndsWith(PostsTag, StringComparison.Ordinal);
+            if (onPole || onPosts)
+            {
+                s = s.Substring(0, s.Length - (onPole ? PoleTag : PostsTag).Length);
+                pole = post2 = null;
+                poleWaitUntil = Time.time + 10f;
+            }
             if (!float.TryParse(s, NumberStyles.Float, CI, out ropeLength)) ropeLength = Tuning.DefaultRope;
             SetHungPhysics(true);
             IsHung = true;
@@ -750,6 +1155,52 @@ namespace HangingHammock
             MarkAnchorsDirty(1f);
             VirtualCrewPatch.RegisterHammock(this);
             Plugin.Log.LogInfo($"Restored hung hammock {k}, rope {ropeLength:0.00}");
+        }
+
+        // The hooks of a hammock hung from surfaces, in its own frame: "a;b;normal a;normal b"
+        // the last two: 1 for a hook on a wood pole
+        private string FreeHooks() => Plugin.V3(topL[0]) + ";" + Plugin.V3(topL[1]) + ";" + Plugin.V3(topN[0]) + ";" + Plugin.V3(topN[1])
+            + ";" + (freeOnPole[0] ? "1" : "0") + ";" + (freeOnPole[1] ? "1" : "0");
+
+        private bool ReadFreeHooks(string s)
+        {
+            var p = s.Split(';');
+            if (p.Length < 4) return false;
+            topL[0] = Plugin.ParseV3(p[0]); topL[1] = Plugin.ParseV3(p[1]);
+            topN[0] = Plugin.ParseV3(p[2]); topN[1] = Plugin.ParseV3(p[3]);
+            for (int i = 0; i < 2; i++) { freeOnPole[i] = p.Length > 4 + i && p[4 + i] == "1"; freePoles[i] = null; }
+            if (freeOnPole[0] || freeOnPole[1]) poleWaitUntil = Time.time + 10f;
+            return topL[0] != Vector3.zero && topL[1] != Vector3.zero;
+        }
+
+        // Hung from poles: true while they hold. After a load they are looked for again (over the hammock, or a post at
+        // each end); a pole picked up, removed or never found takes the hammock down (it drops where it hung).
+        private bool PoleHolds()
+        {
+            if ((pole == null || (onPosts && post2 == null)) && Time.time < poleWaitUntil)
+            {
+                if (onPole)
+                {
+                    Vector3 top = twin.TransformPoint(new Vector3(0f, Top, 0f));
+                    if (PoleSupport.Find(top, ropeLength + 0.3f, out var hit)) pole = hit.pole;
+                }
+                else
+                {
+                    Vector3 a = twin.TransformPoint(EndLocal(-1f)), b = twin.TransformPoint(EndLocal(1f));
+                    var pa = PoleSupport.PostNear(a, a.y + 0.05f, PostMaxGap, null);
+                    var pb = pa != null ? PoleSupport.PostNear(b, b.y + 0.05f, PostMaxGap, pa) : null;
+                    if (pb != null) { pole = pa; post2 = pb; }
+                }
+                if (pole != null && (!onPosts || post2 != null)) { poleWaitUntil = 0f; MarkAnchorsDirty(0f); }
+                return true;
+            }
+            if (PoleSupport.Usable(pole) && (!onPosts || PoleSupport.Usable(post2))) return true;
+
+            colGraceUntil = Time.unscaledTime + 1f;
+            item.nailed = false;
+            Unhang();
+            Notify("The pole is gone: hammock taken down");
+            return false;
         }
 
         internal static void Notify(string msg)

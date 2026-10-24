@@ -35,17 +35,25 @@ namespace HangingHammock
             P(0f, -Neck * 0.5f, rw);
             P(0f, -Neck,        rw);
 
-            // J-изгиб: от 180° через низ (270°) до ~380°, конец заострён
+            // J-изгиб: от 180° через низ (270°) до ~380°, конец тупой: проволока чуть сужается и скруглена полусферой
             const int arcN = 20;
             float span = Mathf.PI + 0.35f;
+            float tipR = rw * 0.85f;
             for (int i = 1; i <= arcN; i++)
             {
                 float u = i / (float)arcN;
                 float a = Mathf.PI + u * span;
                 float x = Reach + Reach * Mathf.Cos(a);
                 float y = -Neck + Reach * Mathf.Sin(a);
-                float r = rw * Mathf.Lerp(1f, 0.04f, Mathf.SmoothStep(0f, 1f, (u - 0.65f) / 0.35f));
-                P(x, y, r);
+                P(x, y, Mathf.Lerp(rw, tipR, Mathf.SmoothStep(0f, 1f, (u - 0.6f) / 0.4f)));
+            }
+            float aEnd = Mathf.PI + span;
+            Vector3 tip = pts[pts.Count - 1], dir = new Vector3(-Mathf.Sin(aEnd), Mathf.Cos(aEnd), 0f);
+            for (int k = 1; k <= 5; k++)
+            {
+                float s = k / 5f;
+                Vector3 c = tip + dir * (tipR * s);
+                P(c.x, c.y, tipR * Mathf.Sqrt(Mathf.Max(0f, 1f - s * s)));
             }
 
             var v = new List<Vector3>(); var n = new List<Vector3>();

@@ -26,13 +26,13 @@ namespace HangingHammock
     {
         public const string GUID = "fluffyjesus.sailwind.hanginghammock";
         public const string NAME = "Hanging Hammock";
-        public const string VERSION = "1.1.2";
+        public const string VERSION = "1.2.0";
 
         internal static ManualLogSource Log;
 
         internal static ConfigEntry<KeyCode> ModeKey, RaiseKey, LowerKey;
         internal static ConfigEntry<bool> UseMouseWheel;
-        internal static ConfigEntry<float> RopeAngle;
+        internal static ConfigEntry<float> RopeAngle, MaxRope, RopeSideAngle;
         internal static ConfigEntry<bool> EnableSwing, FreezeSwingInBed, SolidWhenHung, ShowHooks;
         internal static ConfigEntry<bool> ShopEnable;
         internal static ConfigEntry<int> PrefabIndex;
@@ -62,6 +62,10 @@ namespace HangingHammock
             "Item index in the prefab directory. Change only on conflict with another item mod, and NEVER after hammocks exist in your save");
 
             Log.LogInfo($"{NAME} {VERSION} loaded");
+			MaxRope = Config.Bind("2 Hammock", "MaxRope", 2f,
+			"Longest rope, metres, from a hammock end to a hook on any surface around it (used when there is no ceiling straight over it)");
+			RopeSideAngle = Config.Bind("2 Hammock", "RopeSideAngle", 20f,
+			"Most a rope may lean sideways, degrees, out of the upright plane through the hammock's length");
 			DetailedRopeTexture = Config.Bind("2 Hammock", "DetailedRopeTexture", false,
 			"false = smooth vanilla Sailwind style rope. true = detailed procedural twisted fiber texture");
         }
